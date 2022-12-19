@@ -49,7 +49,11 @@ def get_basis(G, max_degree, compute_gradients):
             cloned_d.requires_grad_()
             log_gradient_norm(cloned_d, 'Basis computation flow')
 
-        #cloned_d.view(-1,20,19,3)[:,:,0,:].view(-1,3)
+        num_nodes = G.num_nodes()
+        num_edges = G.num_edges()
+        num_edges = num_edges//num_nodes
+        num_nodes = num_edges+1
+        #cloned_d.view(-1,num_nodes,num_edges,3)[:,:,0,:].view(-1,3)
         ##identical across edges
         # Relative positional encodings (vector)
         r_ij = utils_steerable.get_spherical_from_cartesian_torch(cloned_d)##reshape to 20x3
@@ -59,7 +63,7 @@ def get_basis(G, max_degree, compute_gradients):
 
         '''
         for idx,y in Y.items():
-            print(y.view(-1,20,19,2*int(idx)+1).shape)
+            print(y.view(-1,num_nodes,num_nodes-1,2*int(idx)+1).shape)
         ##confirm identical across edges
         '''
 
@@ -628,7 +632,7 @@ class GConvSE3Partial(nn.Module):
                     dim1,dim2 = src.shape[-1],src.shape[-2]
 
                     if dim2 == 3:
-                        print(edges.dst['x'].view(-1,20,19,3,1)[:,:,0,:,:])## other points
+                        print(edges.dst['x'].view(-1,,19,3,1)[:,:,0,:,:])## other points
                         
                         print(edges.src['x'].view(-1,20,19,3,1)[:,:,0,:,:])#x_0
                         print(src) #v_0
@@ -853,9 +857,13 @@ class GSE3Res(nn.Module):
         v = self.GMAB['v'](features, G=G, **kwargs)
         k = self.GMAB['k'](features, G=G, **kwargs)
         q = self.GMAB['q'](features, G=G,**kwargs)
+        num_nodes = G.num_nodes()
+        num_edges = G.num_edges()
+        num_edges = num_edges//num_nodes
+        num_nodes = num_edges + 1
         for key in q.keys():
             dim1,dim2 = q[key].shape[-1],q[key].shape[-2]
-            q[key] = q[key].view(-1,20,19,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
+            q[key] = q[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
 
         # Attention
         z = self.GMAB['attn'](v, k=k, q=q, G=G)

@@ -41,7 +41,9 @@ def get_basis(G, max_degree, compute_gradients):
         context = nullcontext()
     else:
         context = torch.no_grad()
-
+    batch_size = G.batch_size
+    num_nodes = G.num_nodes()//batch_size
+    num_edges = G.num_edges()//(batch_size*num_nodes)
     with context:
         cloned_d = torch.clone(G.edata['d'])
 
@@ -49,11 +51,15 @@ def get_basis(G, max_degree, compute_gradients):
             cloned_d.requires_grad_()
             log_gradient_norm(cloned_d, 'Basis computation flow')
 
-        num_nodes = G.num_nodes()
-        num_edges = G.num_edges()
-        num_edges = num_edges//num_nodes
-        num_nodes = num_edges+1
-        #cloned_d.view(-1,num_nodes,num_edges,3)[:,:,0,:].view(-1,3)
+
+
+
+
+        #print(cloned_d.view(batch_size,num_nodes,num_edges,-1).shape)
+        cloned_d = cloned_d.view(batch_size,num_nodes,num_edges,-1) ## reshape to BxNxEx3
+        cloned_d = cloned_d[:,:,0,:]##BxNx3
+        cloned_d = cloned_d.view(batch_size*num_nodes,-1)#back to original shape
+        #print(f'dist data is {cloned_d.shape}')
         ##identical across edges
         # Relative positional encodings (vector)
         r_ij = utils_steerable.get_spherical_from_cartesian_torch(cloned_d)##reshape to 20x3
@@ -228,9 +234,9 @@ class GConvSE3(nn.Module):
             # Add edge features
             if 'w' in G.edata.keys():
                 w = G.edata['w']
-                print(w)
-                #feat = torch.cat([w, r], -1)
-                feat = w*r
+
+                feat = torch.cat([w, r], -1)
+                #feat = w*r
             else:
                 feat = torch.cat([r, ], -1)
 
@@ -320,6 +326,7 @@ class PairwiseConv(nn.Module):
         # Get radial weights
         R = self.rp(feat)
         kernel = torch.sum(R * basis[f'{self.degree_in},{self.degree_out}'], -1)
+
         return kernel.view(kernel.shape[0], self.d_out*self.nc_out, -1)
 
 class G1x1SE3(nn.Module):
@@ -592,7 +599,7 @@ class GConvSE3Partial(nn.Module):
     def __repr__(self):
         return f'GConvSE3Partial(structure={self.f_out})'
 
-    def udf_u_mul_e(self, d_out):
+    def udf_u_mul_e(self, d_out,batch_size,num_nodes,num_edges):
         """Compute the partial convolution for a single output feature type.
 
         This function is set up as a User Defined Function in DGL.
@@ -605,7 +612,9 @@ class GConvSE3Partial(nn.Module):
         def fnc(edges):
             # Neighbor -> center messages
             msg = 0
+
             for m_in, d_in in self.f_in.structure:
+
                 # if type 1 and flag set, add relative position as feature
                 if self.x_ij == 'cat' and d_in == 1:
                     # relative positions
@@ -641,6 +650,18 @@ class GConvSE3Partial(nn.Module):
                     '''
                 edge = edges.data[f'({d_in},{d_out})'] ## This is W, k-->l (indeed the concatenation makes dim double)
 
+                ## reduce computation to linear
+                e1,e2 = edge.shape[-1],edge.shape[-2]
+                s1,s2 = src.shape[-1],src.shape[-2]
+                edge = edge.view(batch_size,num_nodes,num_edges,e2,e1)
+
+                edge = edge[:,:,0,:,:]
+                edge = edge.view(batch_size*num_nodes,e2,e1)
+
+                #print(f'src shape is {src.shape}')
+                src = src.view(batch_size,num_nodes,num_edges,s2,s1)
+                src = src[:,:,0,:,:]
+                src = src.view(batch_size*num_nodes,s2,s1)
 
                 #print(edges.data)
                 '''
@@ -654,6 +675,12 @@ class GConvSE3Partial(nn.Module):
                 '''
 
                 msg = msg + torch.matmul(edge, src)
+            m1,m2 = msg.shape[-1],msg.shape[-2]
+            msg = msg.view(batch_size,num_nodes,m2,m1,1)
+            msg = msg.expand(batch_size,num_nodes,m2,m1,num_edges)
+            msg = msg.permute(0,1,-1,2,3).contiguous()
+            msg = msg.view(batch_size*num_nodes*num_edges,m2,m1)
+            #print(f'msg shape is {msg.shape}')
             msg = msg.view(msg.shape[0], -1, 2*d_out+1)
 
             return {f'out{d_out}': msg.view(msg.shape[0], -1, 2*d_out+1)}
@@ -671,6 +698,10 @@ class GConvSE3Partial(nn.Module):
         Returns:
             tensor with new features [B, n_points, n_features_out]
         """
+        batch_size = G.batch_size
+        num_nodes = G.num_nodes()//batch_size
+        num_edges = G.num_edges()//(batch_size*num_nodes)
+
         with G.local_scope():
             # Add node features to local graph scope
             for k, v in h.items():
@@ -682,17 +713,35 @@ class GConvSE3Partial(nn.Module):
             if 'w' in G.edata.keys():
                 w = G.edata['w'] # shape: [#edges_in_batch, #bond_types]
                 feat = torch.cat([w, r], -1)
+
                 #feat = (w*r).expand(-1,2)
             else:
                 feat = torch.cat([r, ], -1)
+
+            feat = feat.view(batch_size,num_nodes,num_edges,-1)
+            feat = feat[:,:,0,:]
+            feat = feat.view(batch_size*num_nodes,-1)
+
             for (mi, di) in self.f_in.structure:
                 for (mo, do) in self.f_out.structure:
                     etype = f'({di},{do})'
-                    G.edata[etype] = self.kernel_unary[etype](feat, basis)
+
+
+
+                    unary = self.kernel_unary[etype](feat, basis)
+                    dim1,dim2 = unary.shape[-1],unary.shape[-2]
+
+                    unary = unary.view(batch_size,num_nodes,dim2,dim1,1)
+                    unary = unary.expand(batch_size,num_nodes,dim2,dim1,num_edges)
+                    unary = unary.permute(0,1,-1,2,3).contiguous()# reshape to BxNxExFx3
+                    unary = unary.view(batch_size*num_nodes*num_edges,dim2,dim1)## flatten
+
+                    #print(f'unary shape is {self.kernel_unary[etype](feat, basis).shape}')
+                    G.edata[etype] = unary #self.kernel_unary[etype](feat, basis)
 
             # Perform message-passing for each output feature type
             for d in self.f_out.degrees:
-                G.apply_edges(self.udf_u_mul_e(d))
+                G.apply_edges(self.udf_u_mul_e(d,batch_size,num_nodes,num_edges))
 
             return {f'{d}': G.edata[f'out{d}'] for d in self.f_out.degrees}
 
@@ -756,22 +805,68 @@ class GMABSE3(nn.Module):
         with G.local_scope():
             # Add node features to local graph scope
             ## We use the stacked tensor representation for attention
+            batch_size = G.batch_size
+            L = G.num_nodes()//batch_size
+            V = {}
+            #print(self.f_value.structure)
             for m, d in self.f_value.structure:
-                G.edata[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m//self.n_heads, 2*d+1)
-            G.edata['k'] = fiber2head(k, self.n_heads, self.f_key, squeeze=True) # [edges, heads, channels](?)
-            G.ndata['q'] = fiber2head(q, self.n_heads, self.f_key, squeeze=True) # [nodes, heads, channels](?)
-            shape_q = G.ndata['q'].shape
-            shape_k = G.edata['k'].shape
-            '''
-            for k_id in range(380):
-                print(k_id)
-                print((G.edata['k'][k_id,:,:]))
-                ## confirm identical accross edges
-            '''
-            # Compute attention weights
-            ## Inner product between (key) neighborhood and (query) center
-            #print(f'shape of query is {shape_q}')
-            #print(f'shape of key is {shape_k}')
+                #G.edata[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m//self.n_heads, 2*d+1)
+                V[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m // self.n_heads, 2 * d + 1)
+            #G.edata['k'] = fiber2head(k, self.n_heads, self.f_key, squeeze=True) # [edges, heads, channels](?)
+            #G.ndata['q'] = fiber2head(q, self.n_heads, self.f_key, squeeze=True) # [nodes, heads, channels](?)
+
+
+
+            Q = fiber2head(k, self.n_heads, self.f_key, squeeze=True) # [edges, heads, channels](?)
+            K = fiber2head(q, self.n_heads, self.f_key, squeeze=True) # [nodes, heads, channels](?)
+
+
+            q1,q2 = Q.shape[-1],Q.shape[-2]
+            k1, k2 = K.shape[-1], K.shape[-2]
+            Q = Q.view(batch_size,L,q2,q1)## BxLxHxd
+            K = Q.view(batch_size, L, k2, k1)
+            Q = Q.permute(0,2,1,3).contiguous()## BxHxLxd
+            K = K.permute(0, 2, 1, 3).contiguous()
+
+            #print(f'q shape is {Q.shape}')
+            #print(f'k shape is {K.shape}')
+
+            A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/np.sqrt(self.f_key.n_features)## should be BxHxLxL
+            #print(f'attn shape is{A.shape}')
+            A = A.softmax(-1)
+
+            
+            output = {}
+            for d in self.f_value.degrees:
+                v = V[f'v{d}']
+                _,head,chan,d_out = v.shape
+                attn = A.view(batch_size,self.n_heads,L,L,1)
+                attn = attn.expand(batch_size,self.n_heads,L,L,chan)## B H L L C
+                #print(f'expanded attention shape{attn.shape}')
+                attn = attn.permute(0,1,-1,2,3).contiguous() # B H C L L
+                v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
+                v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
+
+                v = torch.matmul(attn,v) ## B H C L d_out
+                v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
+
+                v = v.permute(0,2,1,-1).contiguous()# B L C dout
+                v = v.view(batch_size*L,chan*self.n_heads,d_out)
+                output[f'{d}'] = v
+                #print(v.shape)
+            return output
+
+
+'''
+
+                ## output is BxLxcxd_out sum over heads
+                #v1,v2 = v.shape[-1],v.shape[-2]
+                #v = v.view(batch_size,L,v2,v1)
+                print(f'value shape is {v.shape}')
+                #output[f'{d}'] = torch.matmul(A,V[f'v{d}'])
+                
+
+
 
             G.apply_edges(fn.e_dot_v('k', 'q', 'e'))
 
@@ -795,9 +890,11 @@ class GMABSE3(nn.Module):
             output = {}
             for m, d in self.f_value.structure:
                 output[f'{d}'] = G.ndata[f'out{d}'].view(-1, m, 2*d+1)
+                print(m)
+                print(f" output shape {output[f'{d}'].shape}")
 
             return output
-
+'''
 
 class GSE3Res(nn.Module):
     """Graph attention block with SE(3)-equivariance and skip connection"""
@@ -854,16 +951,28 @@ class GSE3Res(nn.Module):
     @profile
     def forward(self, features, G, **kwargs):
         # Embeddings
+
         v = self.GMAB['v'](features, G=G, **kwargs)
         k = self.GMAB['k'](features, G=G, **kwargs)
         q = self.GMAB['q'](features, G=G,**kwargs)
-        num_nodes = G.num_nodes()
-        num_edges = G.num_edges()
-        num_edges = num_edges//num_nodes
-        num_nodes = num_edges + 1
+        batch_size = G.batch_size
+        num_nodes = G.num_nodes() // batch_size
+        num_edges = G.num_edges() // (batch_size*num_nodes)
+
         for key in q.keys():
+            #print(q[key].shape)
             dim1,dim2 = q[key].shape[-1],q[key].shape[-2]
             q[key] = q[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
+
+        for key in k.keys():
+            #print(k[key].shape)
+            dim1,dim2 = k[key].shape[-1],k[key].shape[-2]
+            k[key] = k[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
+
+        for key in v.keys():
+            #print(v[key].shape)
+            dim1,dim2 = v[key].shape[-1],v[key].shape[-2]
+            v[key] = v[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
 
         # Attention
         z = self.GMAB['attn'](v, k=k, q=q, G=G)

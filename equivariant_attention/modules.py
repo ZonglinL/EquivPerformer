@@ -748,7 +748,7 @@ class GConvSE3Partial(nn.Module):
 
 class GMABSE3(nn.Module):
     """An SE(3)-equivariant multi-headed self-attention module for DGL graphs."""
-    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int):
+    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int,Performer):
         """SE(3)-equivariant MAB (multi-headed attention block) layer.
 
         Args:
@@ -761,6 +761,7 @@ class GMABSE3(nn.Module):
         self.f_key = f_key
         self.n_heads = n_heads
         self.new_dgl = version.parse(dgl.__version__) > version.parse('0.4.4')
+        self.Performer = Performer
 
     def __repr__(self):
         return f'GMABSE3(n_heads={self.n_heads}, structure={self.f_value})'
@@ -791,6 +792,22 @@ class GMABSE3(nn.Module):
 
 
     @profile
+
+    def Phi(self,z,w):
+        '''
+
+        z: Q or K with shape B H L d
+        w: random features with shape m d
+        return: random feature approximation
+        '''
+        m = w.shape[0]
+        scaler = torch.exp(-(z*z).sum(-1)/2)/np.sqrt(m) ## B H L
+        z = z.unsqueeze(-1).contiguous().expand(z.shape[0],z.shape[1],z.shape[2],z.shape[3],m)## B H L d m
+        z = z.transpose(-1,-2).contiguous() ## B H L m d
+        z_prime = (z*w).sum(-1) ## dot product of z and w, shape B H L m
+        z_prime = z_prime.permute(-1,0,1,2).contiguous() ## m B H L
+
+        return (z_prime*scaler).permute(1,2,3,0) ##B H L m
     def forward(self, v, k: Dict=None, q: Dict=None, G=None, **kwargs):
         """Forward pass of the linear layer
 
@@ -823,6 +840,7 @@ class GMABSE3(nn.Module):
 
             q1,q2 = Q.shape[-1],Q.shape[-2]
             k1, k2 = K.shape[-1], K.shape[-2]
+            d_scaler = np.sqrt(self.f_key.n_features)
             Q = Q.view(batch_size,L,q2,q1)## BxLxHxd
             K = Q.view(batch_size, L, k2, k1)
             Q = Q.permute(0,2,1,3).contiguous()## BxHxLxd
@@ -831,10 +849,39 @@ class GMABSE3(nn.Module):
             #print(f'q shape is {Q.shape}')
             #print(f'k shape is {K.shape}')
 
-            A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/np.sqrt(self.f_key.n_features)## should be BxHxLxL
-            #print(f'attn shape is{A.shape}')
-            A = A.softmax(-1)
 
+            if self.Performer:
+                #This is the performer setting
+                w = torch.randn(size=(4,q1))
+                w = torch.cat([w,-w],dim = 0).cuda() ## 8*d, antithetic
+                num_rand_feat = w.shape[0]
+                K_prime = self.Phi(K/np.sqrt(d_scaler),w).transpose(-1,-2).contiguous()  # B H m L
+                Q_prime = self.Phi(Q / np.sqrt(d_scaler),w) ## B H L m
+                output = {}
+                for d in self.f_value.degrees:
+                    v = V[f'v{d}']
+                    _,head,chan,d_out = v.shape
+
+                    v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
+                    v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
+                    k = K_prime.unsqueeze(-1).expand(batch_size,self.n_heads,num_rand_feat,L,chan).permute(0,1,-1,2,3).contiguous()        ## B H m L C --> B H C m L then KV = B H C m d_out
+                    q = Q_prime.unsqueeze(-1).expand(batch_size,self.n_heads,L,num_rand_feat, chan).permute(0, 1, -1, 2, 3).contiguous() ## B H L m C --> B H C L m QKV = B H C L d_out
+
+                    v = torch.matmul(q,torch.matmul(k,v))  # B H C L d_out
+                    v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
+                    v = v.permute(0,2,1,-1).contiguous()# B L C dout
+                    v = v.view(batch_size*L,chan*self.n_heads,d_out)
+                    output[f'{d}'] = v
+                return output
+
+
+
+            ##
+
+            A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/d_scaler## should be BxHxLxL
+
+            A = A.softmax(-1)
+            #print(f'attn shape is{A.shape}')
             
             output = {}
             for d in self.f_value.degrees:
@@ -848,13 +895,18 @@ class GMABSE3(nn.Module):
                 v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
 
                 v = torch.matmul(attn,v) ## B H C L d_out
-                v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
 
-                v = v.permute(0,2,1,-1).contiguous()# B L C dout
+                v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
+                v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
+
+                #print(v.shape)
                 v = v.view(batch_size*L,chan*self.n_heads,d_out)
                 output[f'{d}'] = v
                 #print(v.shape)
+
             return output
+            
+
 
 
 '''
@@ -899,7 +951,7 @@ class GMABSE3(nn.Module):
 class GSE3Res(nn.Module):
     """Graph attention block with SE(3)-equivariance and skip connection"""
     def __init__(self, f_in: Fiber, f_out: Fiber, edge_dim: int=0, div: float=4,
-                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1', x_ij=None):
+                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1', x_ij=None,Performer = False):
         super().__init__()
         self.f_in = f_in
         self.f_out = f_out
@@ -929,7 +981,8 @@ class GSE3Res(nn.Module):
         self.GMAB['q'] = GConvSE3Partial(f_in, self.f_mid_in, edge_dim=edge_dim, x_ij=x_ij)
 
         # Attention
-        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads)
+        self.Performer = Performer
+        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,Performer=self.Performer)
 
         # Skip connections
         if self.skip == 'cat':

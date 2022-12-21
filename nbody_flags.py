@@ -65,6 +65,8 @@ def get_flags():
                         help="Number of data loader workers")
     parser.add_argument('--profile', action='store_true',
                         help="Exit after 10 steps for profiling")
+    parser.add_argument('--Performer',action='store_true',
+                        help="Use Performer" )
 
     # Random seed for both Numpy and Pytorch
     parser.add_argument('--seed', type=int, default=1992)

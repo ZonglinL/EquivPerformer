@@ -8,7 +8,7 @@ class SE3Transformer(nn.Module):
     """SE(3) equivariant GCN with attention"""
 
     def __init__(self, num_layers: int, num_channels: int, num_degrees: int = 4, div: float = 4,
-                 n_heads: int = 1, si_m='1x1', si_e='att', x_ij='add'):
+                 n_heads: int = 1, si_m='1x1', si_e='att', x_ij='add',Performer = False):
         """
         Args:
             num_layers: number of attention layers
@@ -30,12 +30,13 @@ class SE3Transformer(nn.Module):
         self.n_heads = n_heads
         self.si_m, self.si_e = si_m, si_e
         self.x_ij = x_ij
-
+        self.Performer = Performer
         self.fibers = {'in': Fiber(dictionary={1: 1}),
                        'mid': Fiber(self.num_degrees, self.num_channels),
                        'out': Fiber(dictionary={1: 2})}
 
         self.Gblock = self._build_gcn(self.fibers)
+
         print(self.Gblock)
 
     def _build_gcn(self, fibers):
@@ -45,12 +46,12 @@ class SE3Transformer(nn.Module):
 
         for i in range(self.num_layers):
             Gblock.append(GSE3Res(fin, fibers['mid'], edge_dim=self.edge_dim, div=self.div, n_heads=self.n_heads,
-                                  learnable_skip=True, skip='cat', selfint=self.si_m, x_ij=self.x_ij))
+                                  learnable_skip=True, skip='cat', selfint=self.si_m, x_ij=self.x_ij,Performer = self.Performer))
             Gblock.append(GNormBias(fibers['mid']))
             fin = fibers['mid']
         Gblock.append(
             GSE3Res(fibers['mid'], fibers['out'], edge_dim=self.edge_dim, div=1, n_heads=min(self.n_heads, 2),
-                    learnable_skip=True, skip='cat', selfint=self.si_e, x_ij=self.x_ij))
+                    learnable_skip=True, skip='cat', selfint=self.si_e, x_ij=self.x_ij,Performer = self.Performer))
         return nn.ModuleList(Gblock)
 
     def forward(self, G):

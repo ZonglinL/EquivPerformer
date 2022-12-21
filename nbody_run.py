@@ -52,6 +52,8 @@ def get_acc(pred, x_T, v_T, y=None, verbose=True):
 
 
 def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, schedul, FLAGS):
+
+
     model.train()
     loss_epoch = 0
 
@@ -143,7 +145,6 @@ def test_epoch(epoch, model, loss_fnc, dataloader, FLAGS, dT):
 
     print(f"Acc is {acc_epoch}\n")
 
-
     wandb.log({"Test loss": loss_epoch}, commit=False)
     for k in keys:
         wandb.log({"Test " + k: acc_epoch[k]}, commit=False)
@@ -202,7 +203,7 @@ def main(FLAGS, UNPARSED_ARGV):
 
     model = models.__dict__.get(FLAGS.model)(FLAGS.num_layers, FLAGS.num_channels, num_degrees=FLAGS.num_degrees,
                                              div=FLAGS.div, n_heads=FLAGS.head, si_m=FLAGS.simid, si_e=FLAGS.siend,
-                                             x_ij=FLAGS.xij)
+                                             x_ij=FLAGS.xij,Performer = FLAGS.Performer)
 
     utils_logging.write_info_file(model, FLAGS=FLAGS, UNPARSED_ARGV=UNPARSED_ARGV, wandb_log_dir=wandb.run.dir)
 
@@ -213,7 +214,7 @@ def main(FLAGS, UNPARSED_ARGV):
     # Optimizer settings
     optimizer = optim.Adam(model.parameters(), lr=FLAGS.lr)
     #optimizer = optim.SGD(model.parameters(), momentum= 0.9, lr=FLAGS.lr/10)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, FLAGS.num_epochs, eta_min=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, FLAGS.num_epochs, eta_min=1e-4)
     criterion = nn.MSELoss()
     criterion = criterion.to(FLAGS.device)
     task_loss = criterion
@@ -224,6 +225,7 @@ def main(FLAGS, UNPARSED_ARGV):
     # Run training
     print('Begin training')
     for epoch in range(FLAGS.num_epochs):
+        torch.cuda.empty_cache()
         torch.save(model.state_dict(), save_path)
         print(f"Saved: {save_path}")
 

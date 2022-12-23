@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 from typing import Dict
+from equivariant_attention.kernelization import *
 
 from equivariant_attention.from_se3cnn import utils_steerable
 from equivariant_attention.fibers import Fiber, fiber2head
@@ -748,7 +749,7 @@ class GConvSE3Partial(nn.Module):
 
 class GMABSE3(nn.Module):
     """An SE(3)-equivariant multi-headed self-attention module for DGL graphs."""
-    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int,Performer):
+    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int,Performer,max_rf,antithetic):
         """SE(3)-equivariant MAB (multi-headed attention block) layer.
 
         Args:
@@ -762,6 +763,8 @@ class GMABSE3(nn.Module):
         self.n_heads = n_heads
         self.new_dgl = version.parse(dgl.__version__) > version.parse('0.4.4')
         self.Performer = Performer
+        self.max_rf = max_rf
+        self.antithetic = antithetic
 
     def __repr__(self):
         return f'GMABSE3(n_heads={self.n_heads}, structure={self.f_value})'
@@ -852,11 +855,20 @@ class GMABSE3(nn.Module):
 
             if self.Performer:
                 #This is the performer setting
-                w = torch.randn(size=(4,q1))
-                w = torch.cat([w,-w],dim = 0).cuda() ## 8*d, antithetic
+
+                if self.antithetic:
+                    w = gaussian_orthogonal_random_matrix(nb_rows=self.max_rf//2,nb_columns=q1)
+                    w = torch.cat([w,-w],dim = 0).cuda() ## 8*d, antithetic
+                else:
+                    w = gaussian_orthogonal_random_matrix(nb_rows=self.max_rf, nb_columns=q1)
+
                 num_rand_feat = w.shape[0]
-                K_prime = self.Phi(K/np.sqrt(d_scaler),w).transpose(-1,-2).contiguous()  # B H m L
-                Q_prime = self.Phi(Q / np.sqrt(d_scaler),w) ## B H L m
+
+                #K_prime = self.Phi(K/np.sqrt(d_scaler),w) #.transpose(-1,-2).contiguous()  # B H m L
+                #Q_prime = self.Phi(Q / np.sqrt(d_scaler),w) ## B H L m
+                K_prime = softmax_kernel(data = K,projection_matrix = w,is_query = False)
+                Q_prime = softmax_kernel(data=  Q, projection_matrix=w, is_query=True)
+                #print(self.f_key.n_features,q1)
                 output = {}
                 for d in self.f_value.degrees:
                     v = V[f'v{d}']
@@ -864,10 +876,11 @@ class GMABSE3(nn.Module):
 
                     v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
                     v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
-                    k = K_prime.unsqueeze(-1).expand(batch_size,self.n_heads,num_rand_feat,L,chan).permute(0,1,-1,2,3).contiguous()        ## B H m L C --> B H C m L then KV = B H C m d_out
+                    #k = K_prime.unsqueeze(-1).expand(batch_size,self.n_heads,num_rand_feat,L,chan).permute(0,1,-1,2,3).contiguous()        ## B H m L C --> B H C m L then KV = B H C m d_out
                     q = Q_prime.unsqueeze(-1).expand(batch_size,self.n_heads,L,num_rand_feat, chan).permute(0, 1, -1, 2, 3).contiguous() ## B H L m C --> B H C L m QKV = B H C L d_out
-
-                    v = torch.matmul(q,torch.matmul(k,v))  # B H C L d_out
+                    k = K_prime.unsqueeze(-1).expand(batch_size, self.n_heads,L, num_rand_feat, chan).permute(0, 1, -1,2,3).contiguous()
+                    #v = torch.matmul(q,torch.matmul(k,v))  # B H C L d_out
+                    v = linear_attention(q,k,v)
                     v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
                     v = v.permute(0,2,1,-1).contiguous()# B L C dout
                     v = v.view(batch_size*L,chan*self.n_heads,d_out)
@@ -880,7 +893,16 @@ class GMABSE3(nn.Module):
 
             A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/d_scaler## should be BxHxLxL
 
+            '''masking
+            mask = torch.zeros(size = (L,L)).cuda()
+
+            mask = mask.fill_diagonal_(-torch.inf).cuda()
+            A = A + mask ##
+            del mask
+            '''
             A = A.softmax(-1)
+
+
             #print(f'attn shape is{A.shape}')
             
             output = {}
@@ -951,13 +973,15 @@ class GMABSE3(nn.Module):
 class GSE3Res(nn.Module):
     """Graph attention block with SE(3)-equivariance and skip connection"""
     def __init__(self, f_in: Fiber, f_out: Fiber, edge_dim: int=0, div: float=4,
-                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1', x_ij=None,Performer = False):
+                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1', x_ij=None,Performer = False,max_rf = 8,antithetic = True):
         super().__init__()
         self.f_in = f_in
         self.f_out = f_out
         self.div = div
         self.n_heads = n_heads
         self.skip = skip  # valid: 'cat', 'sum', None
+        self.max_rf = max_rf
+        self.antithetic = antithetic
 
         # f_mid_out has same structure as 'f_out' but #channels divided by 'div'
         # this will be used for the values
@@ -982,7 +1006,7 @@ class GSE3Res(nn.Module):
 
         # Attention
         self.Performer = Performer
-        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,Performer=self.Performer)
+        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,Performer=self.Performer,max_rf=self.max_rf,antithetic=self.antithetic)
 
         # Skip connections
         if self.skip == 'cat':

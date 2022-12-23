@@ -27,3 +27,12 @@ remove selfint
 --siend att 
 --simid att 
 ```
+
+maximum number of random featuers
+```
+--max_rf = 8
+```
+use antithetic or not
+```
+--antithetic
+```

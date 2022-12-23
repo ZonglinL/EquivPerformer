@@ -11,11 +11,6 @@ This is for reload
 --restore ./models/ri_dgl.pt
 --restore ./pretrain/ri_dgl.pt
 ```
-
- use performer
-```
---Performer 
-```
 remove selfint
 ```
 --siend 1x1  
@@ -28,11 +23,9 @@ remove selfint
 --simid att 
 ```
 
-maximum number of random featuers
+
+ use performer
+ adjust max number of random features and antithetic or not
 ```
---max_rf = 8
-```
-use antithetic or not
-```
---antithetic
+--Performer --max_rf = 8 --antithetic
 ```

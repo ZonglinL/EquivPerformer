@@ -98,7 +98,7 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, schedul, FLAGS):
         if FLAGS.profile and i == 10:
             sys.exit()
 
-        schedul.step(epoch + i / num_iters)
+        schedul.step(epoch + i/num_iters )
 
     # log train accuracy for entire epoch to wandb
     loss_epoch /= len(dataloader)
@@ -203,7 +203,7 @@ def main(FLAGS, UNPARSED_ARGV):
 
     model = models.__dict__.get(FLAGS.model)(FLAGS.num_layers, FLAGS.num_channels, num_degrees=FLAGS.num_degrees,
                                              div=FLAGS.div, n_heads=FLAGS.head, si_m=FLAGS.simid, si_e=FLAGS.siend,
-                                             x_ij=FLAGS.xij,Performer = FLAGS.Performer)
+                                             x_ij=FLAGS.xij,Performer = FLAGS.Performer,max_rf = FLAGS.max_rf,antithetic = FLAGS.antithetic)
 
     utils_logging.write_info_file(model, FLAGS=FLAGS, UNPARSED_ARGV=UNPARSED_ARGV, wandb_log_dir=wandb.run.dir)
 

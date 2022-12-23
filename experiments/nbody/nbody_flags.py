@@ -66,7 +66,12 @@ def get_flags():
     parser.add_argument('--profile', action='store_true',
                         help="Exit after 10 steps for profiling")
     parser.add_argument('--Performer',action='store_true',
-                        help="Use Performer" )
+                        help="Use Performer or not" )
+    parser.add_argument('--antithetic',action='store_true',
+                        help="Use antithetic or not" )
+
+    parser.add_argument('--max_rf',type =int,default=8,
+                        help="maximum random features" )
 
     # Random seed for both Numpy and Pytorch
     parser.add_argument('--seed', type=int, default=1992)

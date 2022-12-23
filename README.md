@@ -27,5 +27,5 @@ remove selfint
  use performer
  adjust max number of random features and antithetic or not
 ```
---Performer --max_rf = 8 --antithetic
+--Performer --max_rf 8 --antithetic
 ```

@@ -59,7 +59,7 @@ def softmax_kernel(data, *, projection_matrix, is_query, normalize_data=True, ep
 
     b, h, *_ = data.shape
     #
-    data_normalizer = (data.shape[1]*data.shape[-1] ** -0.25) if normalize_data else 1.
+    data_normalizer = ((data.shape[1]*data.shape[-1]) ** -0.25) if normalize_data else 1.
 
     ratio = (projection_matrix.shape[0] ** -0.5)
 

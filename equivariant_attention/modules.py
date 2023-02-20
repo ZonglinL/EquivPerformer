@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 
 from typing import Dict
-from equivariant_attention.kernelization import *
 
 from equivariant_attention.from_se3cnn import utils_steerable
 from equivariant_attention.fibers import Fiber, fiber2head
@@ -18,6 +17,7 @@ import dgl
 import dgl.function as fn
 from dgl.nn.pytorch.softmax import edge_softmax
 from dgl.nn.pytorch.glob import AvgPooling, MaxPooling
+from equivariant_attention.kernelization import *
 
 from packaging import version
 
@@ -56,14 +56,8 @@ def get_basis(G, max_degree, compute_gradients):
 
 
 
-        #print(cloned_d.view(batch_size,num_nodes,num_edges,-1).shape)
-        cloned_d = cloned_d.view(batch_size,num_nodes,num_edges,-1) ## reshape to BxNxEx3
-        cloned_d = cloned_d[:,:,0,:]##BxNx3
-        cloned_d = cloned_d.view(batch_size*num_nodes,-1)#back to original shape
-        #print(f'dist data is {cloned_d.shape}')
-        ##identical across edges
         # Relative positional encodings (vector)
-        r_ij = utils_steerable.get_spherical_from_cartesian_torch(cloned_d)##reshape to 20x3
+        r_ij = utils_steerable.get_spherical_from_cartesian_torch(cloned_d)
         # Spherical harmonic basis
         Y = utils_steerable.precompute_sh(r_ij, 2*max_degree)
         device = Y[0].device
@@ -362,6 +356,30 @@ class G1x1SE3(nn.Module):
                 output[k] = torch.matmul(self.transform[str(k)], v)
         return output
 
+class GNonlin(nn.Module):
+    """Graph Linear SE(3)-equivariant layer, equivalent to a 1x1 convolution.
+
+    This is equivalent to a self-interaction layer in TensorField Networks.
+    """
+    def __init__(self):
+        """SE(3)-equivariant 1x1 convolution.
+
+        Args:
+            f_in: input Fiber() of feature multiplicities and types
+            f_out: output Fiber() of feature multiplicities and types
+        """
+        super().__init__()
+        self.act = nn.ReLU(inplace = True)
+
+    def __repr__(self):
+         return f"Nonlinear"
+
+    def forward(self, features, **kwargs):
+        output = {}
+        for k, v in features.items():
+            output[k] = self.act(v)
+        return output
+
 
 class GNormBias(nn.Module):
     """Norm-based SE(3)-equivariant nonlinearity with only learned biases."""
@@ -651,38 +669,11 @@ class GConvSE3Partial(nn.Module):
                     '''
                 edge = edges.data[f'({d_in},{d_out})'] ## This is W, k-->l (indeed the concatenation makes dim double)
 
-                ## reduce computation to linear
-                e1,e2 = edge.shape[-1],edge.shape[-2]
-                s1,s2 = src.shape[-1],src.shape[-2]
-                edge = edge.view(batch_size,num_nodes,num_edges,e2,e1)
 
-                edge = edge[:,:,0,:,:]
-                edge = edge.view(batch_size*num_nodes,e2,e1)
 
-                #print(f'src shape is {src.shape}')
-                src = src.view(batch_size,num_nodes,num_edges,s2,s1)
-                src = src[:,:,0,:,:]
-                src = src.view(batch_size*num_nodes,s2,s1)
-
-                #print(edges.data)
-                '''
-                print(edge.shape)
-                print(src.shape)
-                print(torch.matmul(edge, src).shape)
-                for i in range(380):
-                    print(edge[i,:,:])
-                    
-                ## confirm identical across edge
-                '''
 
                 msg = msg + torch.matmul(edge, src)
-            m1,m2 = msg.shape[-1],msg.shape[-2]
-            msg = msg.view(batch_size,num_nodes,m2,m1,1)
-            msg = msg.expand(batch_size,num_nodes,m2,m1,num_edges)
-            msg = msg.permute(0,1,-1,2,3).contiguous()
-            msg = msg.view(batch_size*num_nodes*num_edges,m2,m1)
-            #print(f'msg shape is {msg.shape}')
-            msg = msg.view(msg.shape[0], -1, 2*d_out+1)
+
 
             return {f'out{d_out}': msg.view(msg.shape[0], -1, 2*d_out+1)}
         return fnc
@@ -712,30 +703,19 @@ class GConvSE3Partial(nn.Module):
 
             # Add edge features
             if 'w' in G.edata.keys():
-                w = G.edata['w'] # shape: [#edges_in_batch, #bond_types]
+                w = G.edata['w']  # shape: [#edges_in_batch, #bond_types]
                 feat = torch.cat([w, r], -1)
-
-                #feat = (w*r).expand(-1,2)
             else:
                 feat = torch.cat([r, ], -1)
 
-            feat = feat.view(batch_size,num_nodes,num_edges,-1)
-            feat = feat[:,:,0,:]
-            feat = feat.view(batch_size*num_nodes,-1)
+            # BxNx(N-1)
+
 
             for (mi, di) in self.f_in.structure:
                 for (mo, do) in self.f_out.structure:
                     etype = f'({di},{do})'
-
-
-
                     unary = self.kernel_unary[etype](feat, basis)
-                    dim1,dim2 = unary.shape[-1],unary.shape[-2]
 
-                    unary = unary.view(batch_size,num_nodes,dim2,dim1,1)
-                    unary = unary.expand(batch_size,num_nodes,dim2,dim1,num_edges)
-                    unary = unary.permute(0,1,-1,2,3).contiguous()# reshape to BxNxExFx3
-                    unary = unary.view(batch_size*num_nodes*num_edges,dim2,dim1)## flatten
 
                     #print(f'unary shape is {self.kernel_unary[etype](feat, basis).shape}')
                     G.edata[etype] = unary #self.kernel_unary[etype](feat, basis)
@@ -749,22 +729,26 @@ class GConvSE3Partial(nn.Module):
 
 class GMABSE3(nn.Module):
     """An SE(3)-equivariant multi-headed self-attention module for DGL graphs."""
-    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int,Performer,max_rf,antithetic):
+    def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int, kernel: bool = True, num_random: int = 5,
+                 antithetic=True):
         """SE(3)-equivariant MAB (multi-headed attention block) layer.
 
         Args:
             f_value: Fiber() object for value-embeddings
             f_key: Fiber() object for key-embeddings
             n_heads: number of heads
+            kernel: Kernelization
         """
         super().__init__()
         self.f_value = f_value
         self.f_key = f_key
         self.n_heads = n_heads
         self.new_dgl = version.parse(dgl.__version__) > version.parse('0.4.4')
-        self.Performer = Performer
-        self.max_rf = max_rf
+        #self.redraw_dict = {}
+        self.kernel = kernel
+        self.num_random = num_random
         self.antithetic = antithetic
+        self.zlyu = True
 
     def __repr__(self):
         return f'GMABSE3(n_heads={self.n_heads}, structure={self.f_value})'
@@ -791,26 +775,9 @@ class GMABSE3(nn.Module):
 
             return {'m': msg}
         return fnc
-        
 
 
     @profile
-
-    def Phi(self,z,w):
-        '''
-
-        z: Q or K with shape B H L d
-        w: random features with shape m d
-        return: random feature approximation
-        '''
-        m = w.shape[0]
-        scaler = torch.exp(-(z*z).sum(-1)/2)/np.sqrt(m) ## B H L
-        z = z.unsqueeze(-1).contiguous().expand(z.shape[0],z.shape[1],z.shape[2],z.shape[3],m)## B H L d m
-        z = z.transpose(-1,-2).contiguous() ## B H L m d
-        z_prime = (z*w).sum(-1) ## dot product of z and w, shape B H L m
-        z_prime = z_prime.permute(-1,0,1,2).contiguous() ## m B H L
-
-        return (z_prime*scaler).permute(1,2,3,0) ##B H L m
     def forward(self, v, k: Dict=None, q: Dict=None, G=None, **kwargs):
         """Forward pass of the linear layer
 
@@ -819,6 +786,7 @@ class GMABSE3(nn.Module):
             v: dict of value edge-features
             k: dict of key edge-features
             q: dict of query node-features
+            kernel: bool for kernelization
         Returns:
             tensor with new features [B, n_points, n_features_out]
         """
@@ -828,10 +796,11 @@ class GMABSE3(nn.Module):
             batch_size = G.batch_size
             L = G.num_nodes()//batch_size
             V = {}
+
             #print(self.f_value.structure)
             for m, d in self.f_value.structure:
                 #G.edata[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m//self.n_heads, 2*d+1)
-                V[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m // self.n_heads, 2 * d + 1)
+                V[f'v{d}'] = v[f'{d}'].view(-1, self.n_heads, m // self.n_heads, 2 * d + 1).contiguous()
             #G.edata['k'] = fiber2head(k, self.n_heads, self.f_key, squeeze=True) # [edges, heads, channels](?)
             #G.ndata['q'] = fiber2head(q, self.n_heads, self.f_key, squeeze=True) # [nodes, heads, channels](?)
 
@@ -839,149 +808,130 @@ class GMABSE3(nn.Module):
 
             Q = fiber2head(k, self.n_heads, self.f_key, squeeze=True) # [edges, heads, channels](?)
             K = fiber2head(q, self.n_heads, self.f_key, squeeze=True) # [nodes, heads, channels](?)
-
+	
 
             q1,q2 = Q.shape[-1],Q.shape[-2]
             k1, k2 = K.shape[-1], K.shape[-2]
-            d_scaler = np.sqrt(self.f_key.n_features)
             Q = Q.view(batch_size,L,q2,q1)## BxLxHxd
             K = Q.view(batch_size, L, k2, k1)
             Q = Q.permute(0,2,1,3).contiguous()## BxHxLxd
             K = K.permute(0, 2, 1, 3).contiguous()
 
-            #print(f'q shape is {Q.shape}')
-            #print(f'k shape is {K.shape}')
+            if self.kernel & self.zlyu:
+                if self.antithetic:
+                    w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random//2, nb_columns=q1)
+                    w = torch.cat([w, -w], dim=0).cuda()
+                else:
+                    w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1)
+
+                num_rand_feature = w.shape[0]
+                k = softmax_kernel(data=K, projection_matrix=w, is_query=False)
+                q = softmax_kernel(data=Q, projection_matrix=w, is_query=True)
+                output = {}
+                for d in self.f_value.degrees:
+
+                    #values:
+                    v = V[f'v{d}']
+                    _, head, chan, d_out = v.shape  # B, H, C, d_out
+                    v = v.contiguous().view(batch_size, L, head, chan,d_out)  ##BxLxHxCxd_out # B, 5, 1, 4, 1 0,2,1,3,-1
+                    v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
+                    #v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
+
+                    #query:
+                    #q = Q_prime.unsqueeze(-1).expand(batch_size, self.n_heads, L, num_rand_feature, chan).permute(0,1,-1, 2, 3).contiguous()
+
+                    #keys:
+                    #k = k.unsqueeze(-1).expand(batch_size, self.n_heads, L, num_rand_feature, chan).permute(0,1,-1, 2, 3).contiguous()
+
+                    #v = linear_attn(q, k, v)
+                    v = compute_attn(q, k, v).contiguous()
+                    v = v.view(batch_size, self.n_heads * chan, L, d_out)  ## B H*C L d_out
+
+                    v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
+                    v = v.view(batch_size * L, chan * self.n_heads, d_out)
+                    output[f'{d}'] = v
 
 
-            if self.Performer:
-                #This is the performer setting
+            elif self.kernel:
+            #redraw
+                #print(f'Kernel is on:{self.kernel}')
+                B, H, L, d_ = Q.shape
+                #if f"{d}" in self.redraw_dict:
 
                 if self.antithetic:
-                    w = gaussian_orthogonal_random_matrix(nb_rows=self.max_rf//2,nb_columns=q1)
-                    w = torch.cat([w,-w],dim = 0).cuda() ## 8*d, antithetic
+                    proj_mat = gaussian_orthogonal_random_matrix(nb_rows=self.num_random // 2, nb_columns=q1)
+                    proj_mat = torch.cat([proj_mat, -proj_mat], dim=0).cuda()
                 else:
-                    w = gaussian_orthogonal_random_matrix(nb_rows=self.max_rf, nb_columns=q1)
+                    proj_mat = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1)
+                    #self.redraw_dict[f"{d}"]=proj_mat
+                #else:
+                    #proj_mat = self.redraw_dict[f"{d}"]
 
-                num_rand_feat = w.shape[0]
+                q = softmax_kernel(Q, projection_matrix = proj_mat, is_query = True) # B, H, C, m, L
+                k = softmax_kernel(K, projection_matrix = proj_mat, is_query = False) # B, H, C, m, L
+                #print(f"Q shape: {Q.shape}")
+                output = {}
+                for d in self.f_value.degrees:
+                    v = V[f'v{d}']
+                    _, head, chan, d_out = v.shape #B, H, C, d_out
+                    #print(f"V shape: {v.shape}")
 
-                #K_prime = self.Phi(K/np.sqrt(d_scaler),w) #.transpose(-1,-2).contiguous()  # B H m L
-                #Q_prime = self.Phi(Q / np.sqrt(d_scaler),w) ## B H L m
-                K_prime = softmax_kernel(data = K,projection_matrix = w,is_query = False)
-                Q_prime = softmax_kernel(data=  Q, projection_matrix=w, is_query=True)
-                #print(self.f_key.n_features,q1)
+                    v = v.contiguous().view(batch_size, L, head, chan, d_out)  ##BxLxHxCxd_out # B, 5, 1, 4, 1 0,2,1,3,-1
+                    #v = v.permute(0, 2, 3, 1, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
+                    v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
+                    v = compute_attn(q, k, v).contiguous()
+                    v = v.view(batch_size, self.n_heads * chan, L, d_out)  ## B H*C L d_out
+
+                    v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
+                    v = v.view(batch_size * L, chan * self.n_heads, d_out)
+                    output[f'{d}'] = v
+                    # print(v.shape)
+            else:
+
+
+                A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/np.sqrt(self.f_key.n_features)## should be BxHxLxL
+
+                A = A.softmax(-1)
+
+            
                 output = {}
                 for d in self.f_value.degrees:
                     v = V[f'v{d}']
                     _,head,chan,d_out = v.shape
-
+                    #print(f"V shape: {v.shape}")
+                    attn = A.view(batch_size,self.n_heads,L,L,1)
+                    attn = attn.expand(batch_size,self.n_heads,L,L,chan)## B H L L C
+                    #print(f'expanded attention shape{attn.shape}')
+                    attn = attn.permute(0,1,-1,2,3).contiguous() # B H C L L
                     v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
                     v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
-                    #k = K_prime.unsqueeze(-1).expand(batch_size,self.n_heads,num_rand_feat,L,chan).permute(0,1,-1,2,3).contiguous()        ## B H m L C --> B H C m L then KV = B H C m d_out
-                    q = Q_prime.unsqueeze(-1).expand(batch_size,self.n_heads,L,num_rand_feat, chan).permute(0, 1, -1, 2, 3).contiguous() ## B H L m C --> B H C L m QKV = B H C L d_out
-                    k = K_prime.unsqueeze(-1).expand(batch_size, self.n_heads,L, num_rand_feat, chan).permute(0, 1, -1,2,3).contiguous()
-                    #v = torch.matmul(q,torch.matmul(k,v))  # B H C L d_out
-                    v = linear_attention(q,k,v)
+
+                    v = torch.matmul(attn,v) ## B H C L d_out
                     v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
+
                     v = v.permute(0,2,1,-1).contiguous()# B L C dout
                     v = v.view(batch_size*L,chan*self.n_heads,d_out)
                     output[f'{d}'] = v
-                return output
-
-
-
-            ##
-
-            A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/d_scaler## should be BxHxLxL
-
-            '''masking
-            mask = torch.zeros(size = (L,L)).cuda()
-
-            mask = mask.fill_diagonal_(-torch.inf).cuda()
-            A = A + mask ##
-            del mask
-            '''
-            A = A.softmax(-1)
-
-
-            #print(f'attn shape is{A.shape}')
-            
-            output = {}
-            for d in self.f_value.degrees:
-                v = V[f'v{d}']
-                _,head,chan,d_out = v.shape
-                attn = A.view(batch_size,self.n_heads,L,L,1)
-                attn = attn.expand(batch_size,self.n_heads,L,L,chan)## B H L L C
-                #print(f'expanded attention shape{attn.shape}')
-                attn = attn.permute(0,1,-1,2,3).contiguous() # B H C L L
-                v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
-                v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
-
-                v = torch.matmul(attn,v) ## B H C L d_out
-
-                v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
-                v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
-
-                #print(v.shape)
-                v = v.view(batch_size*L,chan*self.n_heads,d_out)
-                output[f'{d}'] = v
-                #print(v.shape)
-
+                    #print(v.shape)
             return output
-            
 
-
-
-'''
-
-                ## output is BxLxcxd_out sum over heads
-                #v1,v2 = v.shape[-1],v.shape[-2]
-                #v = v.view(batch_size,L,v2,v1)
-                print(f'value shape is {v.shape}')
-                #output[f'{d}'] = torch.matmul(A,V[f'v{d}'])
-                
-
-
-
-            G.apply_edges(fn.e_dot_v('k', 'q', 'e'))
-
-            ## Apply softmax
-            e = G.edata.pop('e')
-
-
-            if self.new_dgl:
-                # in dgl 5.3, e has an extra dimension compared to dgl 4.3
-                # the following, we get rid of this be reshaping
-                n_edges = G.edata['k'].shape[0]
-                e = e.view([n_edges, self.n_heads])
-            e = e / np.sqrt(self.f_key.n_features)
-            G.edata['a'] = edge_softmax(G, e)
-            # Perform attention-weighted message-passing
-
-
-            for d in self.f_value.degrees:
-                G.update_all(self.udf_u_mul_e(d), fn.sum('m', f'out{d}'))
-
-            output = {}
-            for m, d in self.f_value.structure:
-                output[f'{d}'] = G.ndata[f'out{d}'].view(-1, m, 2*d+1)
-                print(m)
-                print(f" output shape {output[f'{d}'].shape}")
-
-            return output
-'''
 
 class GSE3Res(nn.Module):
     """Graph attention block with SE(3)-equivariance and skip connection"""
     def __init__(self, f_in: Fiber, f_out: Fiber, edge_dim: int=0, div: float=4,
-                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1', x_ij=None,Performer = False,max_rf = 8,antithetic = True):
+                 n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1',
+                 x_ij=None, kernel=True, num_random=5, antithetic=True):
         super().__init__()
         self.f_in = f_in
         self.f_out = f_out
         self.div = div
         self.n_heads = n_heads
         self.skip = skip  # valid: 'cat', 'sum', None
-        self.max_rf = max_rf
-        self.antithetic = antithetic
+        self.kernel = kernel
+        self.num_random = num_random
+        self.antithetic =antithetic
+
+
 
         # f_mid_out has same structure as 'f_out' but #channels divided by 'div'
         # this will be used for the values
@@ -1001,29 +951,42 @@ class GSE3Res(nn.Module):
         # Projections
         self.GMAB['v'] = GConvSE3Partial(f_in, self.f_mid_out, edge_dim=edge_dim, x_ij=x_ij)
         self.GMAB['k'] = GConvSE3Partial(f_in, self.f_mid_in, edge_dim=edge_dim, x_ij=x_ij)
-        #self.GMAB['q'] = G1x1SE3(f_in, self.f_mid_in)
-        self.GMAB['q'] = GConvSE3Partial(f_in, self.f_mid_in, edge_dim=edge_dim, x_ij=x_ij)
 
+        self.GMAB['q'] = GConvSE3Partial(f_in, self.f_mid_in, edge_dim=edge_dim, x_ij=x_ij)
+        #self.GMAB['q'] = G1x1SE3(f_in, self.f_mid_in)
         # Attention
-        self.Performer = Performer
-        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,Performer=self.Performer,max_rf=self.max_rf,antithetic=self.antithetic)
+        self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,
+                                    kernel=self.kernel, num_random=self.num_random, antithetic=self.antithetic)
 
         # Skip connections
+
+
         if self.skip == 'cat':
             self.cat = GCat(self.f_mid_out, f_in)
             if selfint == 'att':
+
                 self.project = GAttentiveSelfInt(self.cat.f_out, f_out)
             elif selfint == '1x1':
                 self.project = G1x1SE3(self.cat.f_out, f_out, learnable=learnable_skip)
+
+
         elif self.skip == 'sum':
-            self.project = G1x1SE3(self.f_mid_out, f_out, learnable=learnable_skip)
-            self.add = GSum(f_out, f_in)
+            self.add = GSum(self.f_mid_out, f_in)
+            if selfint == '1x1':
+                self.project = G1x1SE3(self.add.f_out, f_out, learnable=learnable_skip)
+
+            elif selfint == 'att':
+                self.project = GAttentiveSelfInt(self.add.f_out, f_out)
+
+
+
+
             # the following checks whether the skip connection would change
             # the output fibre strucure; the reason can be that the input has
             # more channels than the ouput (for at least one degree); this would
             # then cause a (hard to debug) error in the next layer
-            assert self.add.f_out.structure_dict == f_out.structure_dict, \
-                'skip connection would change output structure'
+            #assert self.add.f_out.structure_dict == f_out.structure_dict, \
+            #    'skip connection would change output structure'
 
     @profile
     def forward(self, features, G, **kwargs):
@@ -1036,20 +999,6 @@ class GSE3Res(nn.Module):
         num_nodes = G.num_nodes() // batch_size
         num_edges = G.num_edges() // (batch_size*num_nodes)
 
-        for key in q.keys():
-            #print(q[key].shape)
-            dim1,dim2 = q[key].shape[-1],q[key].shape[-2]
-            q[key] = q[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
-
-        for key in k.keys():
-            #print(k[key].shape)
-            dim1,dim2 = k[key].shape[-1],k[key].shape[-2]
-            k[key] = k[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
-
-        for key in v.keys():
-            #print(v[key].shape)
-            dim1,dim2 = v[key].shape[-1],v[key].shape[-2]
-            v[key] = v[key].view(-1,num_nodes,num_edges,dim2,dim1)[:,:,0,:,:].view(-1,dim2,dim1)
 
         # Attention
         z = self.GMAB['attn'](v, k=k, q=q, G=G)
@@ -1060,8 +1009,10 @@ class GSE3Res(nn.Module):
             z = self.project(z)
         elif self.skip == 'sum':
             # Skip + residual
-            z = self.project(z)
             z = self.add(z, features)
+            z = self.project(z)
+
+
         return z
 
 ### Helper and wrapper functions

@@ -18,6 +18,7 @@ import dgl.function as fn
 from dgl.nn.pytorch.softmax import edge_softmax
 from dgl.nn.pytorch.glob import AvgPooling, MaxPooling
 from equivariant_attention.kernelization import *
+import time
 
 from packaging import version
 
@@ -440,7 +441,7 @@ class GAttentiveSelfInt(nn.Module):
         super().__init__()
         self.f_in = f_in
         self.f_out = f_out
-        self.nonlin = nn.LeakyReLU()
+        self.nonlin = nn.ReLU()
         self.num_layers = 2
         self.eps = 1e-12 # regularisation for phase: gradients explode otherwise
 
@@ -656,17 +657,6 @@ class GConvSE3Partial(nn.Module):
                 else:
                     src = edges.src[f'{d_in}'].view(-1, m_in*(2*d_in+1), 1)#velocity
 
-                    '''
-                    dim1,dim2 = src.shape[-1],src.shape[-2]
-
-                    if dim2 == 3:
-                        print(edges.dst['x'].view(-1,,19,3,1)[:,:,0,:,:])## other points
-                        
-                        print(edges.src['x'].view(-1,20,19,3,1)[:,:,0,:,:])#x_0
-                        print(src) #v_0
-                        #print(src.view(-1,20,19,dim2,dim1)[:,:,0,:,:].squeeze(-3).view(-1,dim2,dim1).shape)
-                        #print(src.shape)
-                    '''
                 edge = edges.data[f'({d_in},{d_out})'] ## This is W, k-->l (indeed the concatenation makes dim double)
 
 
@@ -817,7 +807,8 @@ class GMABSE3(nn.Module):
             Q = Q.permute(0,2,1,3).contiguous()## BxHxLxd
             K = K.permute(0, 2, 1, 3).contiguous()
 
-            if self.kernel & self.zlyu:
+            if self.kernel:
+
                 if self.antithetic:
                     w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random//2, nb_columns=q1)
                     w = torch.cat([w, -w], dim=0).cuda()
@@ -825,14 +816,51 @@ class GMABSE3(nn.Module):
                     w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1)
 
                 num_rand_feature = w.shape[0]
+                base = time.time()
                 k = softmax_kernel(data=K, projection_matrix=w, is_query=False)
                 q = softmax_kernel(data=Q, projection_matrix=w, is_query=True)
+                #print(f"get softmax kernel cost {time.time() - base}")
                 output = {}
+
+
+                v_size = []
+                v = []
                 for d in self.f_value.degrees:
 
+                    value = V[f'v{d}']
+                    _, head, chan, d_out = value.shape  # B, H, C, sum(d_out)
+                    value = value.contiguous().view(batch_size, L, head, chan, d_out)  ##BxLxHxCxd_out
+                    value = value.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxLxCxd_out
+
+                    v_size.append(value.size(-1))
+                    v.append(value)
+                v = torch.cat(v,-1) ## B H L C sum(d_out)
+
+
+                base = time.time()
+
+                v = compute_attn(q, k, v).contiguous()
+                #context = torch.matmul(k.transpose(-1,-2),v.view(batch_size,head,L,-1))
+                #v = torch.matmul(q,context).view(*v.shape)
+
+                #print(f"fast attn cost {time.time() - base}")
+                v = v.view(batch_size, self.n_heads * chan, L, -1)  ## B H*C L sum(d_out)
+
+                v = v.permute(0, 2, 1, -1).contiguous()  # B L C sum(dout)
+                v = v.view(batch_size * L, chan * self.n_heads, -1) ## BL C sum(d_out)
+
+                v = torch.split(v,v_size,dim = -1)
+                count = 0
+                for d in self.f_value.degrees:
+                    output[f'{d}'] = v[count]
+                    count += 1
+
+
                     #values:
-                    v = V[f'v{d}']
+                    '''
                     _, head, chan, d_out = v.shape  # B, H, C, d_out
+
+
                     v = v.contiguous().view(batch_size, L, head, chan,d_out)  ##BxLxHxCxd_out # B, 5, 1, 4, 1 0,2,1,3,-1
                     v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
                     #v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
@@ -850,51 +878,47 @@ class GMABSE3(nn.Module):
                     v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
                     v = v.view(batch_size * L, chan * self.n_heads, d_out)
                     output[f'{d}'] = v
+                    '''
 
-
-            elif self.kernel:
-            #redraw
-                #print(f'Kernel is on:{self.kernel}')
-                B, H, L, d_ = Q.shape
-                #if f"{d}" in self.redraw_dict:
-
-                if self.antithetic:
-                    proj_mat = gaussian_orthogonal_random_matrix(nb_rows=self.num_random // 2, nb_columns=q1)
-                    proj_mat = torch.cat([proj_mat, -proj_mat], dim=0).cuda()
-                else:
-                    proj_mat = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1)
-                    #self.redraw_dict[f"{d}"]=proj_mat
-                #else:
-                    #proj_mat = self.redraw_dict[f"{d}"]
-
-                q = softmax_kernel(Q, projection_matrix = proj_mat, is_query = True) # B, H, C, m, L
-                k = softmax_kernel(K, projection_matrix = proj_mat, is_query = False) # B, H, C, m, L
-                #print(f"Q shape: {Q.shape}")
-                output = {}
-                for d in self.f_value.degrees:
-                    v = V[f'v{d}']
-                    _, head, chan, d_out = v.shape #B, H, C, d_out
-                    #print(f"V shape: {v.shape}")
-
-                    v = v.contiguous().view(batch_size, L, head, chan, d_out)  ##BxLxHxCxd_out # B, 5, 1, 4, 1 0,2,1,3,-1
-                    #v = v.permute(0, 2, 3, 1, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
-                    v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
-                    v = compute_attn(q, k, v).contiguous()
-                    v = v.view(batch_size, self.n_heads * chan, L, d_out)  ## B H*C L d_out
-
-                    v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
-                    v = v.view(batch_size * L, chan * self.n_heads, d_out)
-                    output[f'{d}'] = v
-                    # print(v.shape)
             else:
 
-
+                base = time.time()
                 A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/np.sqrt(self.f_key.n_features)## should be BxHxLxL
 
                 A = A.softmax(-1)
-
+                #print(f"compute A cost {time.time() - base}")
             
                 output = {}
+                v_size = []
+                v = []
+
+                for d in self.f_value.degrees:
+                    value = V[f'v{d}']
+
+                    _, head, chan, d_out = value.shape  # B, H, C, sum(d_out)
+                    value = value.contiguous().view(batch_size, L, head, chan, d_out)  ##BxLxHxCxd_out
+                    value = value.permute(0, 2, 3, 1, -1).contiguous()  ## BxHxCxLxd_out
+                    v_size.append(value.size(-1))
+                    v.append(value)
+                attn = A.view(batch_size, self.n_heads, L, L, 1)
+                attn = attn.expand(batch_size, self.n_heads, L, L, chan)  ## B H L L C
+                attn = attn.permute(0, 1, -1, 2, 3).contiguous()  # B H C L L
+                v = torch.cat(v, -1)## B H C L sum(d_out)
+
+                base = time.time()
+                v = torch.matmul(attn,v) ## B H C L dout
+                #print(f'compute AV cost {time.time() - base}')
+                v = v.view(batch_size, self.n_heads * chan, L, -1)  ## B H*C L sum(d_out)
+
+                v = v.permute(0, 2, 1, -1).contiguous()  # B L C sum(dout)
+
+                v = v.view(batch_size * L, chan * self.n_heads, -1)
+                v = torch.split(v,v_size,dim=-1)
+                count = 0
+                for d in self.f_value.degrees:
+                    output[f'{d}'] = v[count]
+                    count += 1
+                '''
                 for d in self.f_value.degrees:
                     v = V[f'v{d}']
                     _,head,chan,d_out = v.shape
@@ -906,13 +930,14 @@ class GMABSE3(nn.Module):
                     v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
                     v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
 
-                    v = torch.matmul(attn,v) ## B H C L d_out
+                    attn = attn.permute(0, 1, -1, 2, 3).contiguous()  # B H C L L
                     v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
-
+                    v = torch.matmul(A, v)  ## B H C L dout
                     v = v.permute(0,2,1,-1).contiguous()# B L C dout
                     v = v.view(batch_size*L,chan*self.n_heads,d_out)
                     output[f'{d}'] = v
                     #print(v.shape)
+                '''
             return output
 
 
@@ -1119,4 +1144,21 @@ class GMaxPooling(nn.Module):
         h = features['0'][...,-1]
         return self.pool(G, h)
 
+class AttentionPooling(nn.Module):
+    """Graph Max Pooling module."""
+    def __init__(self,dim):
+        super().__init__()
+        self.dim = dim
+        self.proj = nn.Linear(self.dim,1)
+    @profile
+    def forward(self, x):
+        """
+
+        :param x: Batch N dim
+        :return:
+        """
+        attention = self.proj(x).softmax(-2) ## Batch N 1
+        x = torch.matmul(attention.transpose(-1,-2),x).view(-1,self.dim) # Batch dim
+
+        return x
 

@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from equivariant_attention.modules import get_basis_and_r, GSE3Res, GNormBias, GConvSE3, GMaxPooling, GAvgPooling,GNormSE3
+from equivariant_attention.modules import get_basis_and_r, GSE3Res, GNormBias, GConvSE3, GMaxPooling, GAvgPooling,GNormSE3, AttentionPooling
 from equivariant_attention.fibers import Fiber
 
 
@@ -40,7 +40,7 @@ class SE3Transformer(nn.Module):
         self.num_points = num_points
         self.out_dim = 64
 
-        self.fibers = {'in': Fiber(dictionary={1: 1}),
+        self.fibers = {'in': Fiber(dictionary={1:1}),
                        'mid': Fiber(self.num_degrees, self.num_channels),
                        'out': Fiber(dictionary={0: self.out_dim})}
         self.kernel = kernel
@@ -49,10 +49,13 @@ class SE3Transformer(nn.Module):
 
         self.Gblock = self._build_gcn(self.fibers)
         self.pooling = GAvgPooling()
+        self.pooling = AttentionPooling(self.out_dim)
+        self.decoder = nn.Sequential(nn.Linear(self.out_dim,self.out_dim), nn.Linear(self.out_dim,self.num_class))
+        '''
         self.hid = torch.nn.Linear(self.out_dim, 64)
-        self.act = torch.nn.ReLU()
+        self.act = torch.nn.Identity()
         self.out = torch.nn.Linear(64, self.num_class)
-
+        '''
 
         print(self.Gblock)
 
@@ -78,15 +81,16 @@ class SE3Transformer(nn.Module):
         basis, r = get_basis_and_r(G, self.num_degrees-1)
 
         h_enc = {'1': torch.zeros_like(G.ndata['x'])}
-        #h_enc = {'1': G.ndata['v']}
+
+        #h_enc = {'1':G.ndata['x']}
         for layer in self.Gblock:
             h_enc = layer(h_enc, G=G, r=r, basis=basis)
         # B*N, 2, 3 ==> B, 3, 2*N
         # enc = h_enc['1'].view(self.batch, 3, -1)
-        h_enc = self.pooling(h_enc,G)
-
+        #h_enc = self.pooling(h_enc,G)
+        h_enc = self.pooling(h_enc['0'].view(self.batch,-1,self.out_dim))
         # print(enc.shape)
-        probs = self.out(self.act(self.hid(h_enc.view(self.batch,-1))))
+        probs = self.decoder(h_enc.view(self.batch,-1))
 
         return probs
 

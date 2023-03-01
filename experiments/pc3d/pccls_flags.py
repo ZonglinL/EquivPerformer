@@ -21,6 +21,8 @@ def get_flags():
                         help="Number of attention heads")
     parser.add_argument('--kernel', action='store_true',
                         help="Performer or not")
+    parser.add_argument('--pool_all', action='store_true',
+                        help="Use three pools or not")
 
 
     # Type of self-interaction in attention layers,

@@ -10,6 +10,8 @@ import random
 from sklearn.neighbors import NearestNeighbors
 DTYPE = np.float32
 
+from .provider import random_scale_point_cloud, jitter_point_cloud,rotate_perturbation_point_cloud
+
 
 
 def loadh5(h5_filename):
@@ -30,7 +32,7 @@ def normalize_data(pcs):
 
     return pcs
 
-
+'''
 def far_sampling(data, n_points):
     N, P, __ = data.shape
 
@@ -48,6 +50,33 @@ def far_sampling(data, n_points):
             dist = np.min(np.array(dist),axis = 0).squeeze()## smallest distance to sampled points length P
             sample_id.append(np.argmax(dist).reshape(1,)) ## append farthest point
         sample_id = np.concatenate(sample_id) ## n_points farthest id
+        sample_id = torch.tensor(sample_id).to(torch.long)
+
+        r[i] = torch.tensor(source)[sample_id]
+
+    return r
+'''
+def far_sampling(data, n_points):
+    N, P, __ = data.shape
+
+    r = torch.zeros(N, n_points, __)
+    for i in range(N):
+        source = data[i] ## P 3
+        id = np.random.randint(low=0, high=P, size=1)
+        sample_id = [id.item()]
+
+
+
+        for j in range(n_points-1):
+
+            tmp = source[sample_id].reshape(len(sample_id),1,3)
+            dist = ((source - tmp)**2).sum(-1) ## len(sample_id) P
+            dist = dist.min(0) ## P
+            far_id = np.argmax(dist).item()
+            sample_id.append(far_id) ## append farthest point
+
+
+        sample_id = np.array(sample_id) ## n_points farthest id
         sample_id = torch.tensor(sample_id).to(torch.long)
 
         r[i] = torch.tensor(source)[sample_id]
@@ -81,9 +110,9 @@ class PC3DDataset(torch.utils.data.Dataset):
         assert split in ["test", "train"]
         if split == "train":
 
-            filename = 'h5_files/main_split_nobg/training_objectdataset.h5'
+            filename = 'h5_files/split1_nobg/training_objectdataset.h5'
         else:
-            filename = 'h5_files/main_split_nobg/test_objectdataset.h5'
+            filename = 'h5_files/split1_nobg/test_objectdataset.h5'
 
 
 
@@ -128,30 +157,26 @@ class PC3DDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
 
         # select a start and a target frame
-
         if self.split == 'test':
-            r  = RandomRotation()
-            x_0 = r(torch.tensor(self.data['points'][idx])) #.astype(DTYPE))
-        else:
-            x_0 = torch.tensor(self.data['points'][idx])
+            r = RandomRotation()
+            x_0 = r(self.data['points'][idx])
 
-        #knn = NearestNeighbors(n_jobs=-1)
-        #knn.fit(x_0)
+        else:
+            x_0 = self.data['points'][idx]
 
         P, D = x_0.shape
         index = torch.LongTensor(random.sample(range(P), self.n_points))
         x_sample = x_0[index]
 
-        #dist,ind = knn.kneighbors(x_sample,11)
-        #ind = ind[:,1:] ## num_points 10 3
-        #features = x_0[ind].mean(1).view(self.n_points,1,D)
-
-
-        '''
         if self.split == 'train':
-            index = torch.LongTensor(random.sample(range(P), self.n_points))  ## random selection
-            x_0 = x_0[index]
-        '''
+
+            x_sample = x_sample.unsqueeze(0).numpy()
+
+            x_sample  = jitter_point_cloud(x_sample)
+            x_sample = torch.tensor(x_sample)
+            x_sample = x_sample.squeeze(0).to(torch.float32)
+
+
 
         label = np.zeros(self.FLAGS.num_class)
         label[self.data['label'][idx]] = 1
@@ -167,9 +192,10 @@ class PC3DDataset(torch.utils.data.Dataset):
         G.ndata['x'] -= avg
 
 
-        G.edata['d'] = G.ndata['x']
+        G.edata['d'] = torch.clone(torch.unsqueeze(x_sample, dim=1)).detach()
+        G.ndata['z'] = torch.clone(torch.unsqueeze(x_sample, dim=1)).detach()
+        G.ndata['z'][...,:-1] = 0
 
-        G.ndata['v'] = G.ndata['x']
 
 
         return G, label_0

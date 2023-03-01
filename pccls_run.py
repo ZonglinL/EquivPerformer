@@ -55,7 +55,10 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, scheduler, FLAGS)
 
         # run model forward and compute loss
         # B, 15
+
         pred = model(g)
+
+
         loss = loss_fnc(pred, cls)
         loss_epoch += to_np(loss)
 
@@ -97,12 +100,17 @@ def test_epoch(epoch, model, loss_fnc, dataloader, FLAGS, dT=None):
     acc_epoch = {'acc': 0.0}
     num_corr = 0
     loss_epoch = 0.0
+    total_time = 0
     for i, (g, y) in enumerate(dataloader):
         g = g.to(FLAGS.device)
         cls = y.to(FLAGS.device)
 
         # run model forward and compute loss
+        base_time = time.time()
         pred = model(g).detach()
+        inf_time = time.time() - base_time
+        total_time += inf_time
+
         loss_epoch += to_np(loss_fnc(pred, cls) / len(dataloader))
         pred, cls = to_np(pred), to_np(cls)
         acc = get_acc(pred, cls)
@@ -117,6 +125,9 @@ def test_epoch(epoch, model, loss_fnc, dataloader, FLAGS, dT=None):
     print(f"...[{epoch}|test] loss: {loss_epoch:.5f}")
 
     print(f"Acc is {acc_epoch}\n")
+
+    #print(total_time)
+
 
 
     return loss_epoch,acc_epoch['acc']
@@ -184,9 +195,9 @@ def main(FLAGS, UNPARSED_ARGV):
 
     #scheduler = optim.lr_scheduler.StepLR(optimizer, 25000, gamma=0.9)
     if FLAGS.kernel:
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75,150], gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60], gamma=0.1)
     else:
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[25, 40], gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30], gamma=0.1)
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(FLAGS.device)
     task_loss = criterion
@@ -195,9 +206,7 @@ def main(FLAGS, UNPARSED_ARGV):
 
     # Run training
     print('Begin training')
-    train_epoch_loss = []
-    test_epoch_loss = []
-    test_epoch_acc = []
+
     name = f'{FLAGS.num_points}_{FLAGS.num_random}_batch16_{FLAGS.siend}_QPartial_{FLAGS.num_layers + 1}_{FLAGS.num_channels//FLAGS.div}'
     print(name)
     for epoch in range(FLAGS.num_epochs):

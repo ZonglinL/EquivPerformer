@@ -1149,6 +1149,7 @@ class AttentionPooling(nn.Module):
     def __init__(self,dim):
         super().__init__()
         self.dim = dim
+        #self.proj = nn.Sequential(nn.Linear(self.dim,2*self.dim),nn.ReLU(), nn.Linear(2*self.dim,1))
         self.proj = nn.Linear(self.dim,1)
     @profile
     def forward(self, x):

@@ -43,13 +43,28 @@ class SE3Transformer(nn.Module):
         self.fibers = {'in': Fiber(dictionary={1:1}),
                        'mid': Fiber(self.num_degrees, self.num_channels),
                        'out': Fiber(dictionary={0: self.out_dim})}
+
+        self.region_fibers = {'in': Fiber(dictionary={1:self.num_channels}),
+                       'mid': Fiber(self.num_degrees, self.num_channels),
+                       'out': Fiber(dictionary={0: self.out_dim})}
+
+        self.sub_fibers = {'in': Fiber(dictionary={1: 1}),
+                              'mid': Fiber(self.num_degrees, self.num_channels),
+                              'out': Fiber(dictionary={1: self.num_channels})}
+
         self.kernel = kernel
         self.num_random = num_random
         self.antithetic = antithetic
 
         self.Gblock = self._build_gcn(self.fibers)
-        self.pooling = GAvgPooling()
+        self.sub_Gblock = self._build_gcn(self.sub_fibers)
+        self.region_Gblock = self._build_gcn(self.region_fibers)
+
+        #self.pooling = GAvgPooling()
+
         self.pooling = AttentionPooling(self.out_dim)
+        self.sub_pooling = AttentionPooling(self.out_dim)
+        self.whole_pooling = AttentionPooling(self.out_dim)
         self.decoder = nn.Sequential(nn.Linear(self.out_dim,self.out_dim), nn.Linear(self.out_dim,self.num_class))
         '''
         self.hid = torch.nn.Linear(self.out_dim, 64)
@@ -76,20 +91,54 @@ class SE3Transformer(nn.Module):
                     num_random=self.num_random, antithetic=self.antithetic))
         return nn.ModuleList(Gblock)
 
-    def forward(self, G):
+    def forward(self, G,sub_G,region_G):
         # Compute equivariant weight basis from relative positions
-        basis, r = get_basis_and_r(G, self.num_degrees-1)
+        global_basis, global_r = get_basis_and_r(G, self.num_degrees-1)
 
-        h_enc = {'1': torch.zeros_like(G.ndata['x'])}
+        global_enc = {'1': torch.zeros_like(G.ndata['x'])}
 
         #h_enc = {'1':G.ndata['x']}
         for layer in self.Gblock:
-            h_enc = layer(h_enc, G=G, r=r, basis=basis)
+            global_enc = layer(global_enc, G=G, r=global_r, basis=global_basis)
         # B*N, 2, 3 ==> B, 3, 2*N
         # enc = h_enc['1'].view(self.batch, 3, -1)
         #h_enc = self.pooling(h_enc,G)
-        h_enc = self.pooling(h_enc['0'].view(self.batch,-1,self.out_dim))
-        # print(enc.shape)
+        global_enc = global_enc['0'].view(self.batch, -1, self.out_dim)
+        global_enc = self.pooling(global_enc).view(self.batch,-1,self.out_dim) ## batch dim
+        #h_enc = global_enc
+
+        local_basis, local_r = get_basis_and_r(sub_G, self.num_degrees-1)
+
+        local_enc = {'1': torch.zeros_like(sub_G.ndata['x'])}
+        
+        for layer in self.sub_Gblock:
+            local_enc = layer(local_enc, G=sub_G, r=local_r, basis=local_basis)
+
+        ##print(local_enc['1'].shape) ## ... chan degree
+        local_enc = local_enc['1'].view(-1,16,self.num_channels,3)## batch*num_corners num_neighbors channel 3
+        local_enc = local_enc.mean(1) ## batch*num_corners channel 3
+        '''
+        local_enc = local_enc['0'].view(-1,16,self.out_dim) ## batch*num_graphs num_neighbors dim
+        local_enc = self.sub_pooling(local_enc) ## batch*num_graphs dim
+        local_enc = torch.stack(torch.split(local_enc,self.batch),1) ## batch num_graphs dim
+        '''
+        #region_enc = torch.stack(torch.split(local_enc,self.batch),1) ## batch num_corners channel 3
+        region_enc = local_enc
+        #print(region_enc.shape)
+        region_basis, region_r = get_basis_and_r(region_G, self.num_degrees - 1)
+
+        region_enc = {'1': region_enc}
+        for layer in self.region_Gblock:
+            region_enc = layer(region_enc, G=region_G, r=region_r , basis=region_basis)
+
+        region_enc = region_enc['0'].view((self.batch, -1, self.out_dim)) ## batch num_corners out_dim
+
+        h_enc = torch.cat([global_enc, region_enc], 1)  ## batch numgraphs+1 dim
+
+
+        #h_enc = torch.cat([global_enc,local_enc],1) ## batch numgraphs+1 dim
+        h_enc = self.whole_pooling(h_enc) ## batch dim
+        
         probs = self.decoder(h_enc.view(self.batch,-1))
 
         return probs

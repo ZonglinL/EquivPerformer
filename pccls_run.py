@@ -45,9 +45,11 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, scheduler, FLAGS)
     num_iters = len(dataloader)
 
 
-    for i, (g, y) in enumerate(dataloader):
+    for i, (g,sub_g,region_g, y) in enumerate(dataloader):
 
         g = g.to(FLAGS.device)
+        sub_g = sub_g.to(FLAGS.device)
+        region_g = region_g.to(FLAGS.device)
         # B, 1
         cls = y.to(FLAGS.device)
 
@@ -56,7 +58,7 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, scheduler, FLAGS)
         # run model forward and compute loss
         # B, 15
 
-        pred = model(g)
+        pred = model(g,sub_g,region_g)
 
 
         loss = loss_fnc(pred, cls)
@@ -101,13 +103,15 @@ def test_epoch(epoch, model, loss_fnc, dataloader, FLAGS, dT=None):
     num_corr = 0
     loss_epoch = 0.0
     total_time = 0
-    for i, (g, y) in enumerate(dataloader):
+    for i, (g,sub_g,region_g, y) in enumerate(dataloader):
         g = g.to(FLAGS.device)
+        sub_g = sub_g.to(FLAGS.device)
+        region_g = region_g.to(FLAGS.device)
         cls = y.to(FLAGS.device)
 
         # run model forward and compute loss
         base_time = time.time()
-        pred = model(g).detach()
+        pred = model(g,sub_g,region_g).detach()
         inf_time = time.time() - base_time
         total_time += inf_time
 
@@ -145,9 +149,16 @@ class RandomRotation(object):
 
 
 def collate(samples):
-    graphs, y = map(list, zip(*samples))
+    graphs, sub_graphs, region_graphs, y = map(list, zip(*samples))
     batched_graph = dgl.batch(graphs)
-    return batched_graph, torch.stack(y)
+    batch_sub = []
+    for j in range(len(sub_graphs[0])): ##each sub_graph in a batch
+        for i in range(len(sub_graphs)): ## batch
+            batch_sub.append(sub_graphs[i][j]) ## batch of first sub, batch of second sub, [batch batch ... batch]
+    batch_sub = dgl.batch(batch_sub)
+    batched_region = dgl.batch(region_graphs)
+
+    return batched_graph, batch_sub,batched_region, torch.stack(y)
 
 
 def main(FLAGS, UNPARSED_ARGV):
@@ -173,7 +184,6 @@ def main(FLAGS, UNPARSED_ARGV):
 
     FLAGS.train_size = len(train_dataset)
     FLAGS.test_size = len(test_dataset)
-    assert len(test_dataset) < len(train_dataset)
 
     model = models.__dict__.get(FLAGS.model)(FLAGS.num_layers, FLAGS.num_channels, num_degrees=FLAGS.num_degrees,
                                              div=FLAGS.div, n_heads=FLAGS.head, si_m=FLAGS.simid, si_e=FLAGS.siend,
@@ -197,7 +207,7 @@ def main(FLAGS, UNPARSED_ARGV):
     if FLAGS.kernel:
         scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60], gamma=0.1)
     else:
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30], gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300], gamma=0.1)
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(FLAGS.device)
     task_loss = criterion

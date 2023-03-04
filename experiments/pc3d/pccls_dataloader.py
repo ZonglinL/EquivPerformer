@@ -32,56 +32,32 @@ def normalize_data(pcs):
 
     return pcs
 
-'''
 def far_sampling(data, n_points):
     N, P, __ = data.shape
 
     r = torch.zeros(N, n_points, __)
-    for i in range(N):
-        source = data[i]
-        id = np.random.randint(low=0, high=P, size=1)
-        sample_id = [id]
-        for j in range(n_points-1):
-            dist = [] ## iterate over number of selected points
-            for k in sample_id:
-                dist_k = ((source - source[k])**2).sum(-1) ## distance to kth points in selected P
-                dist.append(dist_k) ## append, KxP
-
-            dist = np.min(np.array(dist),axis = 0).squeeze()## smallest distance to sampled points length P
-            sample_id.append(np.argmax(dist).reshape(1,)) ## append farthest point
-        sample_id = np.concatenate(sample_id) ## n_points farthest id
-        sample_id = torch.tensor(sample_id).to(torch.long)
-
-        r[i] = torch.tensor(source)[sample_id]
-
-    return r
-'''
-def far_sampling(data, n_points):
-    N, P, __ = data.shape
-
-    r = torch.zeros(N, n_points, __)
+    sample_id_whole = np.zeros((N,n_points))
     for i in range(N):
         source = data[i] ## P 3
         id = np.random.randint(low=0, high=P, size=1)
         sample_id = [id.item()]
 
-
-
-        for j in range(n_points-1):
+        for j in range(n_points):
 
             tmp = source[sample_id].reshape(len(sample_id),1,3)
             dist = ((source - tmp)**2).sum(-1) ## len(sample_id) P
             dist = dist.min(0) ## P
             far_id = np.argmax(dist).item()
+            sample_id_whole[i,j] = far_id
             sample_id.append(far_id) ## append farthest point
 
 
         sample_id = np.array(sample_id) ## n_points farthest id
         sample_id = torch.tensor(sample_id).to(torch.long)
 
-        r[i] = torch.tensor(source)[sample_id]
+        #r[i] = torch.tensor(source)[sample_id]
 
-    return r
+    return sample_id_whole
 
 class RandomRotation(object):
     def __init__(self):
@@ -105,6 +81,12 @@ class PC3DDataset(torch.utils.data.Dataset):
         self.FLAGS = FLAGS
         self.split = split
         self.n_points = FLAGS.num_points
+        self.num_corners = 12
+        self.num_neighbors = 16
+        self.region = int(2048//(2*self.num_corners))
+
+
+
 
 
         assert split in ["test", "train"]
@@ -126,12 +108,18 @@ class PC3DDataset(torch.utils.data.Dataset):
             #points = far_sampling(points, self.n_points)
 
             print('test points sampled')
+        self.far_id = far_sampling(points,self.num_corners).astype(np.int64) ## N num_corners
+
 
 
         points, label = torch.tensor(points).to(torch.float), torch.tensor(label)
+        if self.split == 'test':
+            r = RandomRotation()
+            points = r(points)
 
         data = {'points':points,
                 'label':label}
+
         self.data = data
         self.len = data['points'].shape[0]
 
@@ -144,12 +132,6 @@ class PC3DDataset(torch.utils.data.Dataset):
         src = []
         dst = []
         for i in range(num_atoms):
-            '''
-            for j in range(num_atoms):
-                if i != j:
-                    src.append(i)
-                    dst.append(j)
-            '''
             src.append(i)
             dst.append(i)
         return np.array(src), np.array(dst)
@@ -157,24 +139,34 @@ class PC3DDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
 
         # select a start and a target frame
-        if self.split == 'test':
-            r = RandomRotation()
-            x_0 = r(self.data['points'][idx])
 
-        else:
-            x_0 = self.data['points'][idx]
+
+
+        x_0 = self.data['points'][idx] ## 2048 * 3
+        if self.split == 'train':
+
+            x_0 = x_0.unsqueeze(0).numpy()
+            x_0 = jitter_point_cloud(x_0)
+            #x_0 = random_scale_point_cloud(x_0,0.9,1.1)
+            x_0 = torch.tensor(x_0)
+            x_0 = x_0.squeeze(0).to(torch.float32)
+
+
+        corner = x_0[self.far_id[idx]]   ## num_corner 3
+        
+        knn = NearestNeighbors(n_jobs=-1)
+        knn.fit(x_0)
+        regions = knn.kneighbors(corner,self.region,return_distance=False) ## num_corner region, ind in x_0
+        neighbors = np.zeros((self.num_corners,self.num_neighbors,3)) ## num_corner num_neighbors 3
+        for i in range(len(regions)):
+            neighbor_ind = random.sample(range(self.region),self.num_neighbors)
+            sampled_neighbor_ind = regions[i][neighbor_ind] ## num_neighhbors
+            neighbors[i] = x_0[sampled_neighbor_ind]
+
 
         P, D = x_0.shape
         index = torch.LongTensor(random.sample(range(P), self.n_points))
         x_sample = x_0[index]
-
-        if self.split == 'train':
-
-            x_sample = x_sample.unsqueeze(0).numpy()
-
-            x_sample  = jitter_point_cloud(x_sample)
-            x_sample = torch.tensor(x_sample)
-            x_sample = x_sample.squeeze(0).to(torch.float32)
 
 
 
@@ -182,21 +174,52 @@ class PC3DDataset(torch.utils.data.Dataset):
         label[self.data['label'][idx]] = 1
         label_0 = torch.tensor(label.astype(DTYPE))
 
+
+        """
+        Entire graph
+        """
         # Create graph (connections only, no bond or feature information yet)
         indices_src, indices_dst = self.connect_fully(self.n_points)
         G = dgl.graph((indices_src, indices_dst))
-
+        avg = x_0.mean(dim=0)
+        x_sample -= avg
         ### add bond & feature information to graph
         G.ndata['x'] = torch.unsqueeze(x_sample, dim=1)  # [N, 1, 3]
-        avg = x_0.mean(dim=0)
-        G.ndata['x'] -= avg
-
-
         G.edata['d'] = torch.clone(torch.unsqueeze(x_sample, dim=1)).detach()
-        G.ndata['z'] = torch.clone(torch.unsqueeze(x_sample, dim=1)).detach()
-        G.ndata['z'][...,:-1] = 0
+        
+        
+        """
+        Graph for each sub_region(corner)
+        """
+        
+        sub_graphs = []
+        for i in range(self.num_corners):
+            sub_src, sub_dst = self.connect_fully(self.num_neighbors)
+            sub_G = dgl.graph((sub_src, sub_dst))
+            sub_sample = torch.tensor(neighbors[i]).to(torch.float32)## num_neighbors 3
+
+            sub_sample -= avg
+            ### add bond & feature information to graph
+            sub_G.ndata['x'] = torch.unsqueeze(sub_sample, dim=1)  # [N, 1, 3]
+            sub_G.edata['d'] = torch.clone(torch.unsqueeze(sub_sample, dim=1)).detach()
+            sub_graphs.append(sub_G)
+        
+        """
+        Graph for center of corners (regions)
+        
+        """
+        region_src, region_dst = self.connect_fully(self.num_corners)
+        region_G = dgl.graph((region_src, region_dst))
+        region_sample = torch.tensor(corner).to(torch.float32)  ## num_neighbors 3
+
+        region_sample -= avg
+        ### add bond & feature information to graph
+        region_G.ndata['x'] = torch.unsqueeze(region_sample, dim=1)  # [N, 1, 3]
+        region_G.edata['d'] = torch.clone(torch.unsqueeze(region_sample, dim=1)).detach()
+            
+        
 
 
 
-        return G, label_0
+        return G, sub_graphs, region_G,label_0
 

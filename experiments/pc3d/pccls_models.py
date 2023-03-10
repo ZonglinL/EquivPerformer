@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from equivariant_attention.modules import get_basis_and_r, GSE3Res, GNormBias, GConvSE3, GMaxPooling, GAvgPooling,GNormSE3, AttentionPooling
+from equivariant_attention.modules import get_basis_and_r, GSE3Res, GNormBias, GConvSE3, GMaxPooling, GAvgPooling, AttentionPooling
 from equivariant_attention.fibers import Fiber
 
 
@@ -44,28 +44,19 @@ class SE3Transformer(nn.Module):
                        'mid': Fiber(self.num_degrees, self.num_channels),
                        'out': Fiber(dictionary={0: self.out_dim})}
 
-        self.region_fibers = {'in': Fiber(dictionary={1:self.num_channels}),
-                       'mid': Fiber(self.num_degrees, self.num_channels),
-                       'out': Fiber(dictionary={0: self.out_dim})}
-
-        self.sub_fibers = {'in': Fiber(dictionary={1: 1}),
-                              'mid': Fiber(self.num_degrees, self.num_channels),
-                              'out': Fiber(dictionary={1: self.num_channels})}
 
         self.kernel = kernel
         self.num_random = num_random
         self.antithetic = antithetic
 
-        self.Gblock = self._build_gcn(self.fibers)
-        self.sub_Gblock = self._build_gcn(self.sub_fibers)
-        self.region_Gblock = self._build_gcn(self.region_fibers)
+        self.Gblock = self._build_gcn(self.fibers,self.num_layers)
+
 
         #self.pooling = GAvgPooling()
-
         self.pooling = AttentionPooling(self.out_dim)
-        self.sub_pooling = AttentionPooling(self.out_dim)
-        self.whole_pooling = AttentionPooling(self.out_dim)
-        self.decoder = nn.Sequential(nn.Linear(self.out_dim,self.out_dim), nn.Linear(self.out_dim,self.num_class))
+
+        self.decoder = nn.Sequential(nn.Linear(self.out_dim,self.out_dim),  nn.Linear(self.out_dim,self.num_class))
+
         '''
         self.hid = torch.nn.Linear(self.out_dim, 64)
         self.act = torch.nn.Identity()
@@ -74,28 +65,36 @@ class SE3Transformer(nn.Module):
 
         print(self.Gblock)
 
-    def _build_gcn(self, fibers):
+    def _build_gcn(self, fibers,num_layers):
         # Equivariant layers
         Gblock = []
         fin = fibers['in']
 
-        for i in range(self.num_layers):
+        for i in range(num_layers):
+            if i == 0:
+                kernel_channel = int(self.num_channels//self.n_heads) * 3
+            else:
+                kernel_channel = int(self.num_channels//self.n_heads) * 16
+
+            
             Gblock.append(GSE3Res(fin, fibers['mid'], edge_dim=self.edge_dim, div=self.div, n_heads=self.n_heads,
                                   learnable_skip=True, skip='cat', selfint=self.si_m, x_ij=self.x_ij, kernel=self.kernel,
-                                  num_random=self.num_random, antithetic=self.antithetic))
+                                  num_random=self.num_random, antithetic=self.antithetic,kernel_channel =kernel_channel))
             Gblock.append(GNormBias(fibers['mid']))
             fin = fibers['mid']
+        kernel_channel = int(self.out_dim//self.n_heads)
         Gblock.append(
             GSE3Res(fibers['mid'], fibers['out'], edge_dim=self.edge_dim, div=1, n_heads=self.n_heads,
                     learnable_skip=True, skip='cat', selfint=self.si_e, x_ij=self.x_ij, kernel=self.kernel,
-                    num_random=self.num_random, antithetic=self.antithetic))
+                    num_random=self.num_random, antithetic=self.antithetic,kernel_channel = kernel_channel))
         return nn.ModuleList(Gblock)
 
-    def forward(self, G,sub_G,region_G):
+    def forward(self, G):
         # Compute equivariant weight basis from relative positions
         global_basis, global_r = get_basis_and_r(G, self.num_degrees-1)
 
         global_enc = {'1': torch.zeros_like(G.ndata['x'])}
+        batch = G.batch_size
 
         #h_enc = {'1':G.ndata['x']}
         for layer in self.Gblock:
@@ -103,43 +102,13 @@ class SE3Transformer(nn.Module):
         # B*N, 2, 3 ==> B, 3, 2*N
         # enc = h_enc['1'].view(self.batch, 3, -1)
         #h_enc = self.pooling(h_enc,G)
-        global_enc = global_enc['0'].view(self.batch, -1, self.out_dim)
-        global_enc = self.pooling(global_enc).view(self.batch,-1,self.out_dim) ## batch dim
-        #h_enc = global_enc
+        global_enc = global_enc['0'].view(batch, -1, self.out_dim)
 
-        local_basis, local_r = get_basis_and_r(sub_G, self.num_degrees-1)
+        global_enc = self.pooling(global_enc).view(batch,self.out_dim) ## batch dim
+        #global_enc = global_enc.mean(1)
+        h_enc = global_enc
 
-        local_enc = {'1': torch.zeros_like(sub_G.ndata['x'])}
-        
-        for layer in self.sub_Gblock:
-            local_enc = layer(local_enc, G=sub_G, r=local_r, basis=local_basis)
-
-        ##print(local_enc['1'].shape) ## ... chan degree
-        local_enc = local_enc['1'].view(-1,16,self.num_channels,3)## batch*num_corners num_neighbors channel 3
-        local_enc = local_enc.mean(1) ## batch*num_corners channel 3
-        '''
-        local_enc = local_enc['0'].view(-1,16,self.out_dim) ## batch*num_graphs num_neighbors dim
-        local_enc = self.sub_pooling(local_enc) ## batch*num_graphs dim
-        local_enc = torch.stack(torch.split(local_enc,self.batch),1) ## batch num_graphs dim
-        '''
-        #region_enc = torch.stack(torch.split(local_enc,self.batch),1) ## batch num_corners channel 3
-        region_enc = local_enc
-        #print(region_enc.shape)
-        region_basis, region_r = get_basis_and_r(region_G, self.num_degrees - 1)
-
-        region_enc = {'1': region_enc}
-        for layer in self.region_Gblock:
-            region_enc = layer(region_enc, G=region_G, r=region_r , basis=region_basis)
-
-        region_enc = region_enc['0'].view((self.batch, -1, self.out_dim)) ## batch num_corners out_dim
-
-        h_enc = torch.cat([global_enc, region_enc], 1)  ## batch numgraphs+1 dim
-
-
-        #h_enc = torch.cat([global_enc,local_enc],1) ## batch numgraphs+1 dim
-        h_enc = self.whole_pooling(h_enc) ## batch dim
-        
-        probs = self.decoder(h_enc.view(self.batch,-1))
+        probs = self.decoder(h_enc.view(batch,-1))
 
         return probs
 

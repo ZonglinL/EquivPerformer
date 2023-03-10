@@ -720,7 +720,7 @@ class GConvSE3Partial(nn.Module):
 class GMABSE3(nn.Module):
     """An SE(3)-equivariant multi-headed self-attention module for DGL graphs."""
     def __init__(self, f_value: Fiber, f_key: Fiber, n_heads: int, kernel: bool = True, num_random: int = 5,
-                 antithetic=True):
+                 antithetic=True,kernel_channel = 1):
         """SE(3)-equivariant MAB (multi-headed attention block) layer.
 
         Args:
@@ -740,31 +740,16 @@ class GMABSE3(nn.Module):
         self.antithetic = antithetic
         self.zlyu = True
 
+        if self.antithetic:
+            w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random // 2, nb_columns=kernel_channel)
+            self.w = torch.cat([w, -w], dim=0).cuda()
+        else:
+            self.w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=kernel_channel).cuda()
+
+
     def __repr__(self):
         return f'GMABSE3(n_heads={self.n_heads}, structure={self.f_value})'
 
-
-
-    def udf_u_mul_e(self, d_out):
-        """Compute the weighted sum for a single output feature type.
-
-        This function is set up as a User Defined Function in DGL.
-
-        Args:
-            d_out: output feature type
-        Returns:
-            edge -> node function handle
-        """
-        def fnc(edges):
-            # Neighbor -> center messages
-            attn = edges.data['a']
-            value = edges.data[f'v{d_out}']
-
-            # Apply attention weights
-            msg = attn.unsqueeze(-1).unsqueeze(-1) * value
-
-            return {'m': msg}
-        return fnc
 
 
     @profile
@@ -807,18 +792,25 @@ class GMABSE3(nn.Module):
             Q = Q.permute(0,2,1,3).contiguous()## BxHxLxd
             K = K.permute(0, 2, 1, 3).contiguous()
 
+
+
             if self.kernel:
-
-                if self.antithetic:
-                    w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random//2, nb_columns=q1)
-                    w = torch.cat([w, -w], dim=0).cuda()
+                base = time.time()
+                if self.training:
+                    if self.antithetic:
+                        w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random // 2, nb_columns=q1)
+                        w = torch.cat([w, -w], dim=0).cuda()
+                    else:
+                        w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1).cuda()
                 else:
-                    w = gaussian_orthogonal_random_matrix(nb_rows=self.num_random, nb_columns=q1)
+                    w = self.w
 
-                num_rand_feature = w.shape[0]
+                #print(f"get random feature cost {time.time() - base}")
+
                 base = time.time()
                 k = softmax_kernel(data=K, projection_matrix=w, is_query=False)
                 q = softmax_kernel(data=Q, projection_matrix=w, is_query=True)
+
                 #print(f"get softmax kernel cost {time.time() - base}")
                 output = {}
 
@@ -829,22 +821,23 @@ class GMABSE3(nn.Module):
 
                     value = V[f'v{d}']
                     _, head, chan, d_out = value.shape  # B, H, C, sum(d_out)
-                    value = value.contiguous().view(batch_size, L, head, chan, d_out)  ##BxLxHxCxd_out
+                    value = value.view(batch_size, L, head, chan , d_out)  ##BxLxHxCxd_out
                     value = value.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxLxCxd_out
 
                     v_size.append(value.size(-1))
                     v.append(value)
-                v = torch.cat(v,-1) ## B H L C sum(d_out)
 
+
+                v = torch.cat(v,-1) ## B H L C sum(d_out)
 
                 base = time.time()
 
                 v = compute_attn(q, k, v).contiguous()
-                #context = torch.matmul(k.transpose(-1,-2),v.view(batch_size,head,L,-1))
-                #v = torch.matmul(q,context).view(*v.shape)
+
 
                 #print(f"fast attn cost {time.time() - base}")
-                v = v.view(batch_size, self.n_heads * chan, L, -1)  ## B H*C L sum(d_out)
+
+                v = v.view(batch_size, self.n_heads * chan, L, -1) ## B H*C L sum(d_out)
 
                 v = v.permute(0, 2, 1, -1).contiguous()  # B L C sum(dout)
                 v = v.view(batch_size * L, chan * self.n_heads, -1) ## BL C sum(d_out)
@@ -856,29 +849,6 @@ class GMABSE3(nn.Module):
                     count += 1
 
 
-                    #values:
-                    '''
-                    _, head, chan, d_out = v.shape  # B, H, C, d_out
-
-
-                    v = v.contiguous().view(batch_size, L, head, chan,d_out)  ##BxLxHxCxd_out # B, 5, 1, 4, 1 0,2,1,3,-1
-                    v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
-                    #v = v.permute(0, 2, 1, 3, -1).contiguous()  ## BxHxCxLxd_out B, 1, 4,5,1
-
-                    #query:
-                    #q = Q_prime.unsqueeze(-1).expand(batch_size, self.n_heads, L, num_rand_feature, chan).permute(0,1,-1, 2, 3).contiguous()
-
-                    #keys:
-                    #k = k.unsqueeze(-1).expand(batch_size, self.n_heads, L, num_rand_feature, chan).permute(0,1,-1, 2, 3).contiguous()
-
-                    #v = linear_attn(q, k, v)
-                    v = compute_attn(q, k, v).contiguous()
-                    v = v.view(batch_size, self.n_heads * chan, L, d_out)  ## B H*C L d_out
-
-                    v = v.permute(0, 2, 1, -1).contiguous()  # B L C dout
-                    v = v.view(batch_size * L, chan * self.n_heads, d_out)
-                    output[f'{d}'] = v
-                    '''
 
             else:
 
@@ -886,7 +856,7 @@ class GMABSE3(nn.Module):
                 A = torch.matmul(Q,K.transpose(-1,-2).contiguous())/np.sqrt(self.f_key.n_features)## should be BxHxLxL
 
                 A = A.softmax(-1)
-                #print(f"compute A cost {time.time() - base}")
+                A_time = time.time() - base
             
                 output = {}
                 v_size = []
@@ -907,7 +877,7 @@ class GMABSE3(nn.Module):
 
                 base = time.time()
                 v = torch.matmul(attn,v) ## B H C L dout
-                #print(f'compute AV cost {time.time() - base}')
+                #print(f'brute force cost {A_time + time.time() - base}')
                 v = v.view(batch_size, self.n_heads * chan, L, -1)  ## B H*C L sum(d_out)
 
                 v = v.permute(0, 2, 1, -1).contiguous()  # B L C sum(dout)
@@ -918,26 +888,7 @@ class GMABSE3(nn.Module):
                 for d in self.f_value.degrees:
                     output[f'{d}'] = v[count]
                     count += 1
-                '''
-                for d in self.f_value.degrees:
-                    v = V[f'v{d}']
-                    _,head,chan,d_out = v.shape
-                    #print(f"V shape: {v.shape}")
-                    attn = A.view(batch_size,self.n_heads,L,L,1)
-                    attn = attn.expand(batch_size,self.n_heads,L,L,chan)## B H L L C
-                    #print(f'expanded attention shape{attn.shape}')
-                    attn = attn.permute(0,1,-1,2,3).contiguous() # B H C L L
-                    v = v.view(batch_size,L,head,chan,d_out)##BxLxHxCxd_out
-                    v = v.permute(0,2,3,1,-1).contiguous() ## BxHxCxLxd_out
 
-                    attn = attn.permute(0, 1, -1, 2, 3).contiguous()  # B H C L L
-                    v = v.view(batch_size,self.n_heads*chan,L,d_out)## B H*C L d_out
-                    v = torch.matmul(A, v)  ## B H C L dout
-                    v = v.permute(0,2,1,-1).contiguous()# B L C dout
-                    v = v.view(batch_size*L,chan*self.n_heads,d_out)
-                    output[f'{d}'] = v
-                    #print(v.shape)
-                '''
             return output
 
 
@@ -945,7 +896,7 @@ class GSE3Res(nn.Module):
     """Graph attention block with SE(3)-equivariance and skip connection"""
     def __init__(self, f_in: Fiber, f_out: Fiber, edge_dim: int=0, div: float=4,
                  n_heads: int=1, learnable_skip=True, skip='cat', selfint='1x1',
-                 x_ij=None, kernel=True, num_random=5, antithetic=True):
+                 x_ij=None, kernel=True, num_random=5, antithetic=True,kernel_channel = 1):
         super().__init__()
         self.f_in = f_in
         self.f_out = f_out
@@ -955,6 +906,8 @@ class GSE3Res(nn.Module):
         self.kernel = kernel
         self.num_random = num_random
         self.antithetic =antithetic
+        self.kernel_channel = kernel_channel
+
 
 
 
@@ -981,7 +934,7 @@ class GSE3Res(nn.Module):
         #self.GMAB['q'] = G1x1SE3(f_in, self.f_mid_in)
         # Attention
         self.GMAB['attn'] = GMABSE3(self.f_mid_out, self.f_mid_in, n_heads=n_heads,
-                                    kernel=self.kernel, num_random=self.num_random, antithetic=self.antithetic)
+                                    kernel=self.kernel, num_random=self.num_random, antithetic=self.antithetic,kernel_channel=self.kernel_channel)
 
         # Skip connections
 
@@ -1144,6 +1097,9 @@ class GMaxPooling(nn.Module):
         h = features['0'][...,-1]
         return self.pool(G, h)
 
+
+
+
 class AttentionPooling(nn.Module):
     """Graph Max Pooling module."""
     def __init__(self,dim):
@@ -1151,15 +1107,19 @@ class AttentionPooling(nn.Module):
         self.dim = dim
         #self.proj = nn.Sequential(nn.Linear(self.dim,2*self.dim),nn.ReLU(), nn.Linear(2*self.dim,1))
         self.proj = nn.Linear(self.dim,1)
+        self.map = nn.Sequential(nn.Identity())
+
     @profile
-    def forward(self, x):
+    def forward(self, x,Print=False):
         """
 
         :param x: Batch N dim
         :return:
         """
+        x = self.map(x)
         attention = self.proj(x).softmax(-2) ## Batch N 1
+        if Print:
+            print(attention.max(1)[0])
         x = torch.matmul(attention.transpose(-1,-2),x).view(-1,self.dim) # Batch dim
 
         return x
-

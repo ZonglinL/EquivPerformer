@@ -45,11 +45,10 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, scheduler, FLAGS)
     num_iters = len(dataloader)
 
 
-    for i, (g,sub_g,region_g, y) in enumerate(dataloader):
+    for i, (g,y) in enumerate(dataloader):
 
         g = g.to(FLAGS.device)
-        sub_g = sub_g.to(FLAGS.device)
-        region_g = region_g.to(FLAGS.device)
+
         # B, 1
         cls = y.to(FLAGS.device)
 
@@ -58,7 +57,7 @@ def train_epoch(epoch, model, loss_fnc, dataloader, optimizer, scheduler, FLAGS)
         # run model forward and compute loss
         # B, 15
 
-        pred = model(g,sub_g,region_g)
+        pred = model(g)
 
 
         loss = loss_fnc(pred, cls)
@@ -102,35 +101,32 @@ def test_epoch(epoch, model, loss_fnc, dataloader, FLAGS, dT=None):
     acc_epoch = {'acc': 0.0}
     num_corr = 0
     loss_epoch = 0.0
-    total_time = 0
-    for i, (g,sub_g,region_g, y) in enumerate(dataloader):
-        g = g.to(FLAGS.device)
-        sub_g = sub_g.to(FLAGS.device)
-        region_g = region_g.to(FLAGS.device)
-        cls = y.to(FLAGS.device)
+    cum  = 0
 
-        # run model forward and compute loss
-        base_time = time.time()
-        pred = model(g,sub_g,region_g).detach()
-        inf_time = time.time() - base_time
-        total_time += inf_time
+    with torch.no_grad():
+        for i, (g,y) in enumerate(dataloader):
 
-        loss_epoch += to_np(loss_fnc(pred, cls) / len(dataloader))
-        pred, cls = to_np(pred), to_np(cls)
-        acc = get_acc(pred, cls)
-        num_corr += acc
-        count += y.shape[0]
-        acc_epoch['acc'] = num_corr/count
+            g = g.to(FLAGS.device)
+
+            cls = y.to(FLAGS.device)
+
+            # run model forward and compute loss
+
+            pred = model(g)
 
 
-        # eval linear baseline
-        # Apply linear update to locations.
+            loss_epoch += loss_fnc(pred, cls) / len(dataloader)
+            pred, cls = pred, cls
+            acc = get_acc(pred, cls)
+            num_corr += acc
+            count += y.shape[0]
+            acc_epoch['acc'] = num_corr/count
 
-    print(f"...[{epoch}|test] loss: {loss_epoch:.5f}")
+            # eval linear baseline
+            # Apply linear update to locations.
+        print(f"...[{epoch}|test] loss: {loss_epoch:.5f}")
 
-    print(f"Acc is {acc_epoch}\n")
-
-    #print(total_time)
+        print(f"Acc is {acc_epoch}\n")
 
 
 
@@ -149,16 +145,11 @@ class RandomRotation(object):
 
 
 def collate(samples):
-    graphs, sub_graphs, region_graphs, y = map(list, zip(*samples))
+    graphs,y = map(list, zip(*samples))
     batched_graph = dgl.batch(graphs)
-    batch_sub = []
-    for j in range(len(sub_graphs[0])): ##each sub_graph in a batch
-        for i in range(len(sub_graphs)): ## batch
-            batch_sub.append(sub_graphs[i][j]) ## batch of first sub, batch of second sub, [batch batch ... batch]
-    batch_sub = dgl.batch(batch_sub)
-    batched_region = dgl.batch(region_graphs)
 
-    return batched_graph, batch_sub,batched_region, torch.stack(y)
+
+    return batched_graph, torch.stack(y)
 
 
 def main(FLAGS, UNPARSED_ARGV):
@@ -205,9 +196,9 @@ def main(FLAGS, UNPARSED_ARGV):
 
     #scheduler = optim.lr_scheduler.StepLR(optimizer, 25000, gamma=0.9)
     if FLAGS.kernel:
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60], gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100], gamma=0.1)
     else:
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300], gamma=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60], gamma=0.1)
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.to(FLAGS.device)
     task_loss = criterion
@@ -217,14 +208,19 @@ def main(FLAGS, UNPARSED_ARGV):
     # Run training
     print('Begin training')
 
-    name = f'{FLAGS.num_points}_{FLAGS.num_random}_batch16_{FLAGS.siend}_QPartial_{FLAGS.num_layers + 1}_{FLAGS.num_channels//FLAGS.div}'
+    name = f'{FLAGS.num_points}_{FLAGS.num_random}_batch{FLAGS.batch_size}_{FLAGS.siend}_QPartial_{FLAGS.num_layers + 1}_{FLAGS.num_channels//FLAGS.div}'
     print(name)
     for epoch in range(FLAGS.num_epochs):
         torch.save(model.state_dict(), save_path)
         print(f"Saved: {save_path}")
 
         train_loss = train_epoch(epoch, model, task_loss, train_loader, optimizer, scheduler, FLAGS)
+        #base = time.time()
+
         test_loss,test_acc = test_epoch(epoch, model, task_loss, test_loader, FLAGS)
+        #epoch_time = time.time() - base
+        #print(f"one epoch costs {epoch_time}")
+
 
         with open(f'{name}_train_loss.csv','a') as f:
             f.write(f'{train_loss}')
@@ -235,6 +231,7 @@ def main(FLAGS, UNPARSED_ARGV):
         with open(f'{name}_test_acc.csv','a') as f:
             f.write(f'{test_acc}')
             f.write('\n')
+
 
 
 if __name__ == '__main__':

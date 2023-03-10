@@ -81,9 +81,10 @@ class PC3DDataset(torch.utils.data.Dataset):
         self.FLAGS = FLAGS
         self.split = split
         self.n_points = FLAGS.num_points
-        self.num_corners = 12
-        self.num_neighbors = 16
-        self.region = int(2048//(2*self.num_corners))
+
+        self.num_corners = 8
+        self.num_neighbors = 36
+        self.region = int(2048//(1.2*self.num_corners))
 
 
 
@@ -106,11 +107,7 @@ class PC3DDataset(torch.utils.data.Dataset):
 
         if self.split == 'test':
             #points = far_sampling(points, self.n_points)
-
             print('test points sampled')
-        self.far_id = far_sampling(points,self.num_corners).astype(np.int64) ## N num_corners
-
-
 
         points, label = torch.tensor(points).to(torch.float), torch.tensor(label)
         if self.split == 'test':
@@ -146,29 +143,17 @@ class PC3DDataset(torch.utils.data.Dataset):
         if self.split == 'train':
 
             x_0 = x_0.unsqueeze(0).numpy()
-            x_0 = jitter_point_cloud(x_0)
+            x_0 = jitter_point_cloud(x_0,0.005)
             #x_0 = random_scale_point_cloud(x_0,0.9,1.1)
             x_0 = torch.tensor(x_0)
             x_0 = x_0.squeeze(0).to(torch.float32)
 
 
-        corner = x_0[self.far_id[idx]]   ## num_corner 3
-        
-        knn = NearestNeighbors(n_jobs=-1)
-        knn.fit(x_0)
-        regions = knn.kneighbors(corner,self.region,return_distance=False) ## num_corner region, ind in x_0
-        neighbors = np.zeros((self.num_corners,self.num_neighbors,3)) ## num_corner num_neighbors 3
-        for i in range(len(regions)):
-            neighbor_ind = random.sample(range(self.region),self.num_neighbors)
-            sampled_neighbor_ind = regions[i][neighbor_ind] ## num_neighhbors
-            neighbors[i] = x_0[sampled_neighbor_ind]
-
-
         P, D = x_0.shape
+
         index = torch.LongTensor(random.sample(range(P), self.n_points))
+
         x_sample = x_0[index]
-
-
 
         label = np.zeros(self.FLAGS.num_class)
         label[self.data['label'][idx]] = 1
@@ -187,39 +172,10 @@ class PC3DDataset(torch.utils.data.Dataset):
         G.ndata['x'] = torch.unsqueeze(x_sample, dim=1)  # [N, 1, 3]
         G.edata['d'] = torch.clone(torch.unsqueeze(x_sample, dim=1)).detach()
         
-        
-        """
-        Graph for each sub_region(corner)
-        """
-        
-        sub_graphs = []
-        for i in range(self.num_corners):
-            sub_src, sub_dst = self.connect_fully(self.num_neighbors)
-            sub_G = dgl.graph((sub_src, sub_dst))
-            sub_sample = torch.tensor(neighbors[i]).to(torch.float32)## num_neighbors 3
-
-            sub_sample -= avg
-            ### add bond & feature information to graph
-            sub_G.ndata['x'] = torch.unsqueeze(sub_sample, dim=1)  # [N, 1, 3]
-            sub_G.edata['d'] = torch.clone(torch.unsqueeze(sub_sample, dim=1)).detach()
-            sub_graphs.append(sub_G)
-        
-        """
-        Graph for center of corners (regions)
-        
-        """
-        region_src, region_dst = self.connect_fully(self.num_corners)
-        region_G = dgl.graph((region_src, region_dst))
-        region_sample = torch.tensor(corner).to(torch.float32)  ## num_neighbors 3
-
-        region_sample -= avg
-        ### add bond & feature information to graph
-        region_G.ndata['x'] = torch.unsqueeze(region_sample, dim=1)  # [N, 1, 3]
-        region_G.edata['d'] = torch.clone(torch.unsqueeze(region_sample, dim=1)).detach()
             
         
 
 
 
-        return G, sub_graphs, region_G,label_0
+        return G, label_0
 
